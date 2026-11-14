@@ -1,0 +1,72 @@
+# Muxtastic — two physical nodes in one process.
+# Each node has its own physical link, client port, virtual identity and MQTT
+# bridge. The web UI and SQLite history are shared; the header shows one strip
+# per node.
+#
+# Copy to muxtastic.toml (or configs/muxtastic.toml) and customise.
+
+[security]
+allow_admin_from = []           # applies to every node
+
+[discovery]
+enabled = true                  # one mDNS entry per node
+
+[web]
+enabled = true
+host = "127.0.0.1"
+port = 8080
+database = "data/muxtastic.db"
+retention_days = 7              # prune packets/messages/raw/traces older than this; 0 = keep forever
+
+[logging]
+level = "info"
+file = "logs/muxtastic.log"
+console = true
+
+[[nodes]]
+name = "home"
+
+[nodes.node]
+type = "serial"
+serial_port = "/dev/ttyUSB0"
+baud_rate = 115200
+
+[nodes.server]
+host = "0.0.0.0"
+port = 4404
+
+[nodes.virtual_node]
+long_name = "Home Mux"
+short_name = "HOME"
+
+[nodes.mqtt_bridge]
+enabled = false
+broker = "mqtt.meshtastic.org"
+port = 8883
+tls = true
+uplink_enabled = true
+downlink_enabled = false
+
+[[nodes]]
+name = "roof"
+
+[nodes.node]
+type = "tcp"
+tcp_host = "192.168.1.101"
+tcp_port = 4403
+
+[nodes.server]
+host = "0.0.0.0"
+port = 4405
+
+[nodes.virtual_node]
+long_name = "Roof Mux"
+short_name = "ROOF"
+
+[nodes.mqtt_bridge]
+enabled = true
+broker = "mqtt.meshtastic.org"
+port = 8883
+tls = true
+uplink_enabled = true
+downlink_enabled = false

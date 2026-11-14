@@ -1,0 +1,22 @@
+services:
+  muxtastic:
+    build: .
+    container_name: muxtastic
+    restart: unless-stopped
+    # Host networking is required for mDNS multicast and for reaching a
+    # physical node on the LAN.
+    network_mode: host
+    volumes:
+      - ./configs/config.yaml:/app/configs/config.yaml:ro
+      - ./logs:/app/logs
+      - ./data:/app/data
+    devices:
+      # Uncomment for a USB-connected node:
+      # - "/dev/ttyUSB0:/dev/ttyUSB0"
+    environment:
+      - TZ=UTC
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

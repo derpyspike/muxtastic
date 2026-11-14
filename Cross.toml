@@ -1,0 +1,10 @@
+# The AWS-LC build (via rustls/rumqttc) needs CMake inside Cross containers.
+[target.aarch64-unknown-linux-gnu]
+pre-build = [
+    "apt-get update && apt-get install -y --no-install-recommends cmake perl",
+]
+
+[target.armv7-unknown-linux-gnueabihf]
+pre-build = [
+    "apt-get update && apt-get install -y --no-install-recommends cmake perl",
+]

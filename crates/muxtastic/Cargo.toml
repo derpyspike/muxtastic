@@ -1,0 +1,37 @@
+[package]
+name = "muxtastic"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Meshtastic multiplexer daemon"
+
+[dependencies]
+muxtastic-core = { path = "../muxtastic-core" }
+muxtastic-web = { path = "../muxtastic-web" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+mdns-sd = "0.21"
+meshtastic = { workspace = true }
+rand = "0.9"
+rumqttc = "0.25"
+serde_yaml_ng = "0.10"
+socket2 = "0.6"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "sync",
+    "time",
+    "signal",
+    "fs",
+] }
+tokio-serial = "5.5"
+toml = "0.8"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -1,0 +1,115 @@
+# Muxtastic — legacy-compatible YAML configuration.
+# Copy to configs/config.yaml and customise. The native TOML schema lives in
+# configs/muxtastic.example.toml; both load into the same typed config.
+# For multiple physical nodes see configs/multi-node.example.toml.
+#
+# The old Multiplextashtic keys are accepted unchanged. Renamed keys such as
+# gateway_enabled, raw_mirror_all, broker2.msh_only and broker2.client_id are
+# rejected with a parse error rather than silently ignored.
+
+physical_node:
+  # "serial" (USB) or "tcp" (network)
+  connection_type: "serial"
+  serial_port: "/dev/ttyUSB0"
+  # serial_port: "COM55"        # Windows
+  baud_rate: 115200
+
+  tcp_host: "192.168.1.100"
+  tcp_port: 4403
+
+  tcp_idle_timeout: 300        # seconds without data before assuming a dead link (0 = disabled)
+  serial_poke_timeout: 45      # serial: poke the link with want_config after Ns silence
+  serial_idle_timeout: 90      # serial: reconnect after Ns silence (keep >60s telemetry)
+
+  reconnect:
+    enabled: true
+    initial_delay: 1
+    max_delay: 60
+    multiplier: 2
+
+server:
+  host: "0.0.0.0"
+  port: 4404                   # 4403 is the physical node default and is rejected
+  max_clients: 20
+  max_payload_size: 10240      # reserved; the wire cap is 512 bytes
+
+virtual_node:
+  long_name: "Virtual Multiplexer"
+  short_name: "VMUX"
+  sync_physical_identity: true
+
+security:
+  blocked_portnums:
+    - "ADMIN_APP"
+  allow_admin_from_ips: []     # IP/CIDR allowlist, e.g. ["192.168.1.0/24", "0.0.0.0/0"]
+
+discovery:
+  # mDNS announcement as _meshtastic._tcp.local. (Linux/BSD; Windows is best-effort)
+  enabled: true
+
+web:
+  enabled: true
+  host: "127.0.0.1"          # loopback by default; exposing it is your call
+  port: 8080
+  database: "data/muxtastic.db"  # SQLite file; connect with any sqlite client
+  retention_days: 7              # prune packets/messages/raw/traces older than this; 0 = keep forever
+  try_all_one_byte_keys: false   # append all 255 non-zero 1-byte PSKs to extra_channels
+  mqtt:
+    # Read-only broker source; also runs alongside physical nodes.
+    enabled: false
+    broker: "mqtt.meshtastic.org"
+    port: 8883
+    tls: true
+    username: ""
+    password: ""
+    client_id: "muxtastic-webd"
+    topics: ["msh/#", "raw/#", "jencore/#", "jenrnode/#"]
+    keepalive: 60
+  # Extra channel keys for decoding opaque packets. The key is base64 (1-byte,
+  # 16-byte or 32-byte PSK). A "*" name tries the key against any channel hash.
+  extra_channels:
+    # - name: Madrid
+    #   key: AQ==
+    # - name: "*"
+    #   key: AQ==
+
+mqtt_bridge:
+  # Proxy relay + optional raw gateway and standard mirror. See docs/mqtt.md.
+  enabled: false
+  broker: "mqtt.meshtastic.org"
+  port: 8883
+  tls: true
+  username: ""
+  password: ""
+  uplink_enabled: true
+  downlink_enabled: false
+  ignore_ok_to_mqtt: false
+  mqtt_username: ""
+  root_topic: "msh"
+  raw_root_topic: "raw"
+  region: ""
+  raw_uplink: false
+  raw_scope: "uncovered"
+  standard_mirror: "auto"
+  # Nexus RAW_TUNNEL feeds: reassemble the firmware's JRAW chunks and publish
+  # the raw frames on their own topic trees (independent of raw_uplink).
+  jencore_raw_uplink: false   # type 1: full MeshCore/JenCore frames
+  jenrnode_raw_uplink: false  # type 2: RNode/Reticulum payloads
+  jencore_root_topic: "jencore"
+  jenrnode_root_topic: "jenrnode"
+  keepalive: 60
+  # broker2:
+  #   enabled: true
+  #   broker: ""
+  #   port: 8883
+  #   tls: true
+  #   username: ""
+  #   password: ""
+  #   keepalive: 60
+  #   raw_uplink: false
+  #   raw_scope: "uncovered"
+
+logging:
+  level: "INFO"                # DEBUG, INFO, WARNING, ERROR
+  file: "logs/muxtastic.log"   # empty string = console only
+  console: true

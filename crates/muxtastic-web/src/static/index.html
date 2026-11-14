@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#1e1e2e">
+  <title>Muxtastic</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <span class="logo">✦</span>
+      <div>
+        <h1>Muxtastic</h1>
+          <p id="version">loading…</p>
+      </div>
+    </div>
+    <div id="node-strips"></div>
+    <div class="top-right">
+      <div class="pills" id="status-pills"></div>
+      <label class="toggle"><input type="checkbox" id="auto-refresh" checked> live</label>
+    </div>
+  </header>
+
+  <nav class="tabs" id="tabs">
+    <button data-tab="stats" class="active">Mesh Stats</button>
+    <button data-tab="chat">Chat</button>
+    <button data-tab="nodes">Nodes</button>
+    <button data-tab="packets">Packets</button>
+    <button data-tab="channels">Channels</button>
+    <button data-tab="raw">Raw feeds</button>
+    <button data-tab="receptions">Receptions</button>
+    <button data-tab="traces">Traces</button>
+    <button data-tab="sources">Sources</button>
+  </nav>
+
+  <main>
+    <section id="tab-stats" class="panel active">
+      <div class="cards" id="stat-cards"></div>
+
+      <div class="grid2">
+        <section class="block">
+          <div class="block-head">
+            <h2>Packets, last 24 hours</h2>
+            <span id="hourly-total" class="muted"></span>
+          </div>
+          <div id="hourly" class="chart"></div>
+        </section>
+        <section class="block">
+          <div class="block-head">
+            <h2>Channel mix</h2>
+            <span id="pie-total" class="muted"></span>
+          </div>
+          <div class="pie-wrap">
+            <div id="channel-pie" class="pie"></div>
+            <div id="pie-legend" class="pie-legend"></div>
+          </div>
+        </section>
+      </div>
+
+      <div class="grid2">
+        <section class="block">
+          <div class="block-head">
+            <h2>Portnums</h2>
+            <span id="portnum-pie-total" class="muted"></span>
+          </div>
+          <div class="pie-wrap compact">
+            <div id="portnum-pie" class="pie compact"></div>
+            <div id="portnum-pie-legend" class="pie-legend"></div>
+          </div>
+          <table><thead><tr><th>Port</th><th class="num">Count</th><th class="num">%</th></tr></thead>
+            <tbody id="portnums"></tbody></table>
+        </section>
+        <section class="block">
+          <h2>Transports</h2>
+          <table><thead><tr><th>Transport</th><th class="num">Count</th><th class="num">%</th></tr></thead>
+            <tbody id="transports"></tbody></table>
+        </section>
+        <section class="block">
+          <h2>Channels</h2>
+          <table><thead><tr><th>Channel</th><th class="num">Packets</th><th class="num">%</th></tr></thead>
+            <tbody id="stat-channels"></tbody></table>
+        </section>
+        <section class="block">
+          <h2>Top senders</h2>
+          <table><thead><tr><th>Node</th><th class="num">Packets</th><th class="num">%</th></tr></thead>
+            <tbody id="top-nodes"></tbody></table>
+        </section>
+      </div>
+    </section>
+
+    <section id="tab-chat" class="panel">
+      <div class="toolbar">
+        <label>Channel
+          <select id="chat-channel"><option value="">All channels</option></select>
+        </label>
+        <button id="chat-refresh" class="button">Refresh</button>
+        <span class="muted" id="chat-count"></span>
+      </div>
+      <div id="chat-list" class="messages"></div>
+    </section>
+
+    <section id="tab-nodes" class="panel">
+      <div class="toolbar">
+        <input id="node-search" type="search" placeholder="Filter nodes by name or id…">
+        <select id="node-role-filter"><option value="">All roles</option></select>
+        <select id="node-via-filter">
+          <option value="">All sources</option>
+          <option value="lora">LoRa</option>
+          <option value="mqtt">MQTT</option>
+        </select>
+        <select id="node-hardware-filter"><option value="">All hardware</option></select>
+        <select id="node-channel-filter"><option value="">All channels</option></select>
+        <span class="muted" id="nodes-count"></span>
+      </div>
+      <div class="table-wrap">
+        <table class="wide">
+          <thead><tr>
+            <th data-sort="name">Node</th><th data-sort="id">ID</th>
+            <th data-sort="last_heard">Last heard</th><th data-sort="snr" class="num">SNR</th>
+            <th data-sort="hops" class="num">Hops</th><th data-sort="battery" class="num">Battery</th>
+            <th data-sort="role">Role</th><th data-sort="hardware">Hardware</th>
+            <th data-sort="channel">Channel</th><th data-sort="position">Position</th>
+            <th data-sort="via">Gateways</th>
+          </tr></thead>
+          <tbody id="nodes-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+
+    <section id="tab-packets" class="panel">
+      <div class="toolbar">
+        <select id="packet-protocol"><option value="">All protocols</option></select>
+        <select id="packet-channel"><option value="">All channels</option></select>
+        <select id="packet-gateway"><option value="">All gateways</option></select>
+        <select id="packet-source">
+          <option value="">All sources</option>
+          <option value="physical">LoRa</option>
+          <option value="mqtt">MQTT</option>
+          <option value="client">Client</option>
+        </select>
+        <select id="packet-decrypted">
+          <option value="">Any decryption</option>
+          <option value="true">Decrypted</option>
+          <option value="false">Not decrypted</option>
+        </select>
+        <button id="packet-refresh" class="button">Refresh</button>
+        <span class="muted" id="packet-count"></span>
+      </div>
+      <div class="table-wrap">
+        <table class="wide">
+          <thead><tr>
+            <th>Time</th><th>From</th><th>To</th><th>Protocol</th><th>Contents</th>
+            <th>Channel</th><th>Gateways</th><th class="num">Bytes</th>
+            <th class="num">SNR</th><th class="num">RSSI</th><th>Source</th>
+          </tr></thead>
+          <tbody id="packets-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="tab-channels" class="panel">
+      <div class="toolbar">
+        <button id="channels-refresh" class="button">Refresh</button>
+        <span class="muted" id="channels-summary"></span>
+      </div>
+      <div id="channels-list" class="channel-list"></div>
+    </section>
+
+    <section id="tab-raw" class="panel">
+      <div class="toolbar">
+        <label>Feed
+          <select id="raw-kind">
+            <option value="">All raw frames</option>
+            <option value="1">JenCore / MeshCore</option>
+            <option value="2">JenRNode / Reticulum</option>
+            <option value="3">Meshtastic packets</option>
+          </select>
+        </label>
+        <button id="raw-refresh" class="button">Refresh</button>
+        <span class="muted" id="raw-count"></span>
+      </div>
+      <div id="raw-list" class="raw-list"></div>
+    </section>
+
+    <section id="tab-receptions" class="panel">
+      <div class="toolbar">
+        <button id="receptions-refresh" class="button">Refresh</button>
+        <span class="muted" id="receptions-count"></span>
+      </div>
+      <div id="receptions-list" class="raw-list"></div>
+    </section>
+
+    <section id="tab-traces" class="panel">
+      <div class="toolbar">
+        <button id="traces-refresh" class="button">Refresh</button>
+        <span class="muted" id="traces-count"></span>
+      </div>
+      <div id="traces-list" class="trace-list"></div>
+    </section>
+
+    <section id="tab-sources" class="panel">
+      <div class="toolbar">
+        <button id="sources-refresh" class="button">Refresh</button>
+        <span class="muted" id="sources-count"></span>
+      </div>
+      <div id="sources-list" class="source-list"></div>
+    </section>
+  </main>
+
+  <dialog id="node-dialog">
+    <div class="dialog-head">
+      <h2 id="node-dialog-title">Node details</h2>
+      <div class="dialog-actions">
+        <a id="node-dialog-open" class="button" target="_blank" rel="noopener">Open in new tab</a>
+        <button id="node-dialog-close" class="button" type="button">Close</button>
+      </div>
+    </div>
+    <div id="node-dialog-body"></div>
+  </dialog>
+
+  <footer>
+    <span id="db-note"></span>
+    <span id="last-refresh"></span>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,18 @@
+/target
+**/*.rs.bk
+
+# Local configs (examples are tracked)
+muxtastic.toml
+config.yaml
+configs/config.yaml
+configs/muxtastic.toml
+configs/site-*.yaml
+configs/site-*.toml
+
+# Runtime
+logs/
+data/
+*.log
+
+# OS
+.DS_Store

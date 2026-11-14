@@ -1,0 +1,19 @@
+[package]
+name = "muxtastic-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Transport-agnostic Meshtastic multiplexer logic"
+
+[dependencies]
+aes = "0.8"
+base64 = "0.22"
+ctr = "0.9"
+meshtastic = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_yaml_ng = "0.10"
+toml = "0.8"

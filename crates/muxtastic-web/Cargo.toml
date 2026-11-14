@@ -1,0 +1,19 @@
+[package]
+name = "muxtastic-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Web UI and SQLite history for the Muxtastic multiplexer"
+
+[dependencies]
+muxtastic-core = { path = "../muxtastic-core" }
+anyhow = "1"
+axum = "0.8"
+meshtastic = { workspace = true }
+rusqlite = { version = "0.42", features = ["bundled"] }
+rumqttc = "0.25"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net"] }
+tracing = "0.1"

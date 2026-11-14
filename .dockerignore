@@ -1,0 +1,10 @@
+target
+.git
+muxtastic.toml
+config.yaml
+configs/config.yaml
+configs/muxtastic.toml
+configs/site-*.yaml
+configs/site-*.toml
+logs
+data
