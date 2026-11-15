@@ -239,6 +239,16 @@ impl Default for DiscoveryConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WebStorage {
+    /// Persistent SQLite file from `web.database`.
+    #[default]
+    Sqlite,
+    /// Volatile SQLite database kept entirely in RAM.
+    Memory,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ExtraChannelConfig {
@@ -254,6 +264,8 @@ pub struct WebConfig {
     pub port: u16,
     /// SQLite file path; `:memory:` is accepted for tests.
     pub database: String,
+    /// Storage backend: `sqlite` (persistent) or `memory` (volatile).
+    pub storage: WebStorage,
     /// Days of packet history to keep; 0 disables cleanup.
     pub retention_days: u64,
     /// Optional read-only MQTT source: `--web-only`, or alongside physical nodes.
@@ -271,6 +283,7 @@ impl Default for WebConfig {
             host: "127.0.0.1".into(),
             port: 8080,
             database: "data/muxtastic.db".into(),
+            storage: WebStorage::Sqlite,
             retention_days: 7,
             mqtt: WebMqttConfig::default(),
             extra_channels: Vec::new(),
@@ -608,6 +621,12 @@ key = "AQ=="
         assert_eq!(config.web.extra_channels[0].name, "Madrid");
         assert_eq!(config.web.extra_channels[1].name, "*");
         assert!(config.web.try_all_one_byte_keys);
+    }
+
+    #[test]
+    fn parses_memory_storage() {
+        let config: Config = toml::from_str("[web]\nstorage = \"memory\"\n").unwrap();
+        assert_eq!(config.web.storage, WebStorage::Memory);
     }
 
     #[test]

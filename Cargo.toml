@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/muxtastic-core", "crates/muxtastic-web", "crates/muxtastic"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.88"
 license = "AGPL-3.0-or-later"

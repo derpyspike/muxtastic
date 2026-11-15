@@ -10,7 +10,9 @@ const state = {
   nodeSort: "last_heard",
   nodeSortDir: "desc",
   nodes: [],
+  nodeFamily: "mt",
   nodeNames: new Map(),
+  packetFamily: "mt",
   packetProtocol: "",
   packetChannel: "",
   packetGateway: "",
@@ -92,12 +94,29 @@ function fmtAgo(seconds) {
   return `${Math.floor(diff / 86400)}d ago`;
 }
 
+function percentile(values, fraction) {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((left, right) => left - right);
+  const position = (sorted.length - 1) * fraction;
+  const lower = Math.floor(position);
+  const upper = Math.ceil(position);
+  if (lower === upper) return sorted[lower];
+  const weight = position - lower;
+  return sorted[lower] * (1 - weight) + sorted[upper] * weight;
+}
+
+function fmtOneDecimal(value) {
+  if (value == null) return "—";
+  const text = Number(value).toFixed(1);
+  return text.endsWith(".0") ? text.slice(0, -2) : text;
+}
+
 function fmtSnr(value) {
-  return value == null ? "—" : `${Number(value).toFixed(1)} dB`;
+  return value == null ? "—" : `${fmtOneDecimal(value)} dB`;
 }
 
 function fmtRssi(value) {
-  return value == null ? "—" : `${value} dBm`;
+  return value == null ? "—" : `${fmtOneDecimal(value)} dBm`;
 }
 
 function fmtCoord(value) {
@@ -560,7 +579,7 @@ function renderTraces(traces) {
 }
 
 async function loadNodeNames() {
-  const nodes = await getJson("/api/nodes");
+  const nodes = await getJson("/api/node-names");
   state.nodeNames = new Map(nodes.map((node) => [Number(node.num), nodeLabel(node)]));
   return nodes;
 }
@@ -639,6 +658,32 @@ function renderSources(sources) {
     }
 
     if (source.kind === "physical" && source.receiver) {
+      const relays = document.createElement("details");
+      relays.className = "source-direct";
+      relays.appendChild(element("summary", "", "Relay stats"));
+      const relayBody = element("div");
+      relays.appendChild(relayBody);
+      let relaysLoaded = false;
+      relays.addEventListener("toggle", async () => {
+        if (!relays.open || relaysLoaded) return;
+        relaysLoaded = true;
+        relayBody.appendChild(empty("loading…"));
+        try {
+          const receiver = encodeURIComponent(source.receiver);
+          const [stats, directNodes, series] = await Promise.all([
+            getJson(`/api/relay-stats?receiver=${receiver}&limit=100`),
+            getJson(`/api/direct-nodes?receiver=${receiver}&limit=100`).catch(() => []),
+            getJson(`/api/relay-series?receiver=${receiver}&limit=2000`).catch(() => []),
+          ]);
+          relayBody.innerHTML = "";
+          relayBody.appendChild(renderRelayStats(stats, directNodes, series));
+        } catch (error) {
+          relayBody.innerHTML = "";
+          relayBody.appendChild(empty(`could not load relay stats: ${error.message}`));
+        }
+      });
+      details.appendChild(relays);
+
       const direct = document.createElement("details");
       direct.className = "source-direct";
       direct.appendChild(element("summary", "", "Direct nodes (zero hop)"));
@@ -798,6 +843,202 @@ function renderMqttGateways(gateways) {
   return table;
 }
 
+function fmtFreqError(value) {
+  return value == null ? "—" : `${fmtOneDecimal(value)} Hz`;
+}
+
+const RELAY_METRICS = [
+  { key: "rssi", label: "RSSI", color: "#89b4fa", format: (value) => fmtRssi(value) },
+  { key: "snr", label: "SNR", color: "#a6e3a1", format: (value) => fmtSnr(value) },
+  { key: "frequency_error", label: "Δf", color: "#f9e2af", format: fmtFreqError, centerZero: true },
+];
+
+const SIGNAL_METRICS = [
+  { key: "rx_rssi", label: "RSSI", color: "#89b4fa", format: (value) => fmtRssi(value) },
+  { key: "rx_snr", label: "SNR", color: "#a6e3a1", format: (value) => fmtSnr(value) },
+  { key: "rx_frequency_error", label: "Δf", color: "#f9e2af", format: fmtFreqError, centerZero: true },
+];
+
+function directNodeLabel(node) {
+  return node.long_name || node.short_name || node.node_id || shortId(node.num);
+}
+
+function relayMatches(relay, directNodes) {
+  const byte = Number(relay.relay_node) & 0xff;
+  return directNodes.filter((node) => (Number(node.num) & 0xff) === byte);
+}
+
+function relayLabel(relay, directNodes) {
+  const names = relayMatches(relay, directNodes).map(directNodeLabel);
+  return names.length ? `${relayId(relay.relay_node) || "0x00"} ${names.join(", ")}` : relayId(relay.relay_node) || "0x00";
+}
+
+function relayMetricValue(metric, relay, field) {
+  const stats = relay[metric.key];
+  return stats && stats.count ? metric.format(stats[field]) : "—";
+}
+
+function renderRelayTable(stats, directNodes) {
+  const table = element("table", "detail-table relay-table");
+  const thead = document.createElement("thead");
+  const head = document.createElement("tr");
+  for (const [label, className] of [
+    ["Relay", ""], ["Packets", "num"], ["Metric", ""],
+    ["Avg", "num"], ["Min", "num"], ["Max", "num"], ["σ", "num"],
+  ]) {
+    head.appendChild(element("th", className, label));
+  }
+  thead.appendChild(head);
+  table.appendChild(thead);
+  const tbody = document.createElement("tbody");
+  for (const relay of stats) {
+    RELAY_METRICS.forEach((metric, index) => {
+      const row = document.createElement("tr");
+      if (index === 0) {
+        const relayCell = element("td");
+        relayCell.rowSpan = RELAY_METRICS.length;
+        relayCell.appendChild(element("span", "mono", relayId(relay.relay_node) || "0x00"));
+        const matches = relayMatches(relay, directNodes).map(directNodeLabel);
+        relayCell.appendChild(
+          element(
+            "div",
+            matches.length ? "relay-candidates" : "relay-candidates muted",
+            matches.length ? matches.join(", ") : "unknown",
+          ),
+        );
+        row.appendChild(relayCell);
+        const packetCell = element("td", "num", fmtNum(relay.packets));
+        packetCell.rowSpan = RELAY_METRICS.length;
+        row.appendChild(packetCell);
+      }
+      const metricCell = element("td", "relay-metric", metric.label);
+      metricCell.style.color = metric.color;
+      row.appendChild(metricCell);
+      for (const field of ["avg", "min", "max", "stddev"]) {
+        row.appendChild(element("td", "num", relayMetricValue(metric, relay, field)));
+      }
+      tbody.appendChild(row);
+    });
+  }
+  table.appendChild(tbody);
+  return table;
+}
+
+function renderRelayChart(stats, metric, directNodes) {
+  const data = stats.filter((relay) => relay[metric.key] && relay[metric.key].count);
+  if (!data.length) return null;
+  let globalMin = Math.min(...data.map((relay) => Number(relay[metric.key].min)));
+  let globalMax = Math.max(...data.map((relay) => Number(relay[metric.key].max)));
+  let clipped = false;
+  if (metric.centerZero) {
+    const values = data
+      .flatMap((relay) => [relay[metric.key].min, relay[metric.key].max])
+      .filter((value) => value != null)
+      .map((value) => Math.abs(Number(value)));
+    const bound = Math.max(1, percentile(values, 0.9));
+    clipped = values.some((value) => value > bound);
+    globalMin = -bound;
+    globalMax = bound;
+  } else if (globalMin === globalMax) {
+    globalMin -= 1;
+    globalMax += 1;
+  }
+  const range = globalMax - globalMin;
+  const block = element("div", "relay-chart");
+  block.appendChild(
+    element(
+      "div",
+      "relay-chart-title",
+      `${metric.label} · ${metric.format(globalMin)} … ${metric.format(globalMax)}${clipped ? " · clipped" : ""}`,
+    ),
+  );
+  for (const relay of data) {
+    const statsForMetric = relay[metric.key];
+    const row = element("div", "relay-chart-row");
+    const label = element("span", "relay-chart-label", relayLabel(relay, directNodes));
+    label.title = relayLabel(relay, directNodes);
+    row.appendChild(label);
+    const track = element("div", "relay-range-track");
+    const minPct = Math.max(0, Math.min(100, ((Number(statsForMetric.min) - globalMin) / range) * 100));
+    const maxPct = Math.max(0, Math.min(100, ((Number(statsForMetric.max) - globalMin) / range) * 100));
+    const avgPct = Math.max(0, Math.min(100, ((Number(statsForMetric.avg) - globalMin) / range) * 100));
+    const fill = element("div", "relay-range-fill");
+    fill.style.left = `${minPct}%`;
+    fill.style.width = `${Math.max(2, maxPct - minPct)}%`;
+    fill.style.background = metric.color;
+    track.appendChild(fill);
+    const marker = element("div", "relay-range-marker");
+    marker.style.left = `${avgPct}%`;
+    track.appendChild(marker);
+    track.title = `min ${metric.format(statsForMetric.min)} · max ${metric.format(statsForMetric.max)} · avg ${metric.format(statsForMetric.avg)} · σ ${metric.format(statsForMetric.stddev)}`;
+    row.appendChild(track);
+    row.appendChild(element("span", "num", metric.format(statsForMetric.avg)));
+    block.appendChild(row);
+  }
+  const legend = element("div", "relay-chart-legend");
+  const rangeSwatch = element("span", "relay-legend-swatch range");
+  rangeSwatch.style.background = metric.color;
+  legend.appendChild(rangeSwatch);
+  legend.appendChild(element("span", "", "min–max"));
+  legend.appendChild(element("span", "relay-legend-swatch marker"));
+  legend.appendChild(element("span", "", "average"));
+  block.appendChild(legend);
+  return block;
+}
+
+function renderRelayTimelines(series, stats, directNodes) {
+  if (!series || !series.length) return null;
+  const groups = new Map();
+  for (const sample of series) {
+    const key = Number(sample.relay_node);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(sample);
+  }
+  if (!groups.size) return null;
+  const wrap = element("div", "relay-timelines");
+  wrap.appendChild(element("div", "relay-chart-title", "Relay timelines"));
+  const relayByByte = new Map(stats.map((relay) => [Number(relay.relay_node), relay]));
+  for (const relay of stats) {
+    const samples = groups.get(Number(relay.relay_node));
+    if (!samples || !samples.length) continue;
+    samples.sort((left, right) => left.received_at - right.received_at);
+    const details = document.createElement("details");
+    details.className = "relay-timeline";
+    details.appendChild(
+      element(
+        "summary",
+        "",
+        `${relayLabel(relayByByte.get(Number(relay.relay_node)) || relay, directNodes)} · ${samples.length} samples`,
+      ),
+    );
+    const metrics = SIGNAL_METRICS.map((metric) => ({ ...metric }));
+    const svg = svgElement("svg", { class: "signal-chart", viewBox: "0 0 520 150" });
+    metrics.forEach((metric, index) => {
+      renderSignalTrack(svg, samples, metric, metric.label, metric.color, 8 + index * 50);
+    });
+    details.appendChild(svg);
+    const legend = renderSignalLegend(samples, metrics);
+    if (legend.childElementCount) details.appendChild(legend);
+    wrap.appendChild(details);
+  }
+  return wrap;
+}
+
+function renderRelayStats(stats, directNodes, series) {
+  if (!stats.length) return empty("No relay observations for this source.");
+  const wrap = element("div", "relay-stats");
+  wrap.appendChild(renderRelayTable(stats, directNodes));
+  const charts = element("div", "relay-charts");
+  for (const metric of RELAY_METRICS) {
+    const chart = renderRelayChart(stats, metric, directNodes);
+    if (chart) charts.appendChild(chart);
+  }
+  if (charts.childElementCount) wrap.appendChild(charts);
+  const timelines = renderRelayTimelines(series, stats, directNodes);
+  if (timelines) wrap.appendChild(timelines);
+  return wrap;
+}
+
 function renderClients(clients) {
   const table = element("table", "detail-table");
   const thead = document.createElement("thead");
@@ -896,14 +1137,26 @@ function renderMessages(messages) {
     if (message.decrypted) meta.appendChild(decryptedTag());
     if (message.reception_count > 0) {
       const best = message.best_snr == null ? "" : ` · best ${fmtSnr(message.best_snr)}`;
-      meta.appendChild(element("span", "", `${message.gateway_count} gateway${message.gateway_count === 1 ? "" : "s"}${best}`));
+      meta.appendChild(
+        element(
+          "span",
+          "",
+          `heard ${message.reception_count} time${message.reception_count === 1 ? "" : "s"} · ${message.gateway_count} gateway${message.gateway_count === 1 ? "" : "s"}${best}`,
+        ),
+      );
     }
     card.appendChild(meta);
 
     if (message.reception_count > 0) {
       const details = document.createElement("details");
       details.className = "receptions";
-      details.appendChild(element("summary", "", `heard by ${message.gateway_count} gateway${message.gateway_count === 1 ? "" : "s"}`));
+      details.appendChild(
+        element(
+          "summary",
+          "",
+          `heard ${message.reception_count} time${message.reception_count === 1 ? "" : "s"} by ${message.gateway_count} gateway${message.gateway_count === 1 ? "" : "s"}`,
+        ),
+      );
       const container = element("div", "reception-list");
       details.appendChild(container);
       let loaded = false;
@@ -966,21 +1219,31 @@ function renderReceptions(container, receptions) {
 }
 
 function fillChannelSelect(select, current, channels) {
-  select.innerHTML = "";
-  const all = element("option", "", "All channels");
-  all.value = "";
-  select.appendChild(all);
-  for (const channel of channels) {
-    const option = element("option", "", channelLabel(channel.channel, channel.name));
-    option.value = channel.key || channelKey(channel.channel, channel.name);
-    select.appendChild(option);
+  const signature = channels
+    .map((channel) => `${channel.key}\t${channelLabel(channel.channel, channel.name)}`)
+    .join("\n");
+  if (select.dataset.options !== signature) {
+    select.innerHTML = "";
+    const all = element("option", "", "All channels");
+    all.value = "";
+    select.appendChild(all);
+    for (const channel of channels) {
+      const option = element("option", "", channelLabel(channel.channel, channel.name));
+      option.value = channel.key || channelKey(channel.channel, channel.name);
+      select.appendChild(option);
+    }
+    select.dataset.options = signature;
   }
-  select.value = current;
+  if (select.value !== current) select.value = current;
 }
 
 async function loadChannels() {
   const channels = await getJson("/api/channels");
-  fillChannelSelect($("chat-channel"), state.channel, channels);
+  fillChannelSelect(
+    $("chat-channel"),
+    state.channel,
+    channels.filter((channel) => channel.channel < 256),
+  );
   fillChannelSelect($("packet-channel"), state.packetChannel, channels);
 }
 
@@ -997,8 +1260,51 @@ function fillFilterSelect(select, current, allLabel, options) {
   select.value = current;
 }
 
+const PACKET_FILTER_IDS = [
+  "packet-protocol",
+  "packet-channel",
+  "packet-gateway",
+  "packet-source",
+  "packet-decrypted",
+];
+
+function meshCoreNodeTypeLabel(type) {
+  switch (Number(type)) {
+    case 1: return "Companion";
+    case 2: return "Repeater";
+    case 3: return "Room Server";
+    case 4: return "Sensor";
+    default: return type == null ? "—" : `Type ${type}`;
+  }
+}
+
+function renderPacketHead(family) {
+  const row = $("packets-head").querySelector("tr");
+  row.innerHTML = "";
+  const labels =
+    family === "mt"
+      ? ["Time", "From", "To", "Protocol", "Contents", "Channel", "Gateways", "Bytes", "SNR", "RSSI", "Source"]
+      : ["Time", "Gateway", "Route", "Payload", "Contents", "Path", "Node", "Sender", "Ch hash", "Bytes", "SNR", "RSSI", "Source"];
+  labels.forEach((label, index) => {
+    const numeric = ["Bytes", "SNR", "RSSI"].includes(label) ? "num" : "";
+    row.appendChild(element("th", numeric, label));
+  });
+}
+
 async function loadPackets() {
+  const family = state.packetFamily;
+  const isMeshtastic = family === "mt";
+  for (const id of PACKET_FILTER_IDS) $(id).hidden = !isMeshtastic;
   await loadNodeNames();
+
+  if (!isMeshtastic) {
+    const kind = family === "mc" ? 1 : 2;
+    const frames = await getJson(`/api/raw?kind=${kind}&limit=500`);
+    renderPacketHead(family);
+    renderJrawPackets(frames);
+    return;
+  }
+
   await loadChannels();
   const filters = await getJson("/api/packet-filters");
   fillFilterSelect($("packet-protocol"), state.packetProtocol, "All protocols", filters.portnums);
@@ -1011,7 +1317,69 @@ async function loadPackets() {
   if (state.packetSource) params.set("source", state.packetSource);
   if (state.packetDecrypted) params.set("decrypted", state.packetDecrypted);
   const packets = await getJson(`/api/packets?${params}`);
+  renderPacketHead("mt");
   renderPackets(packets);
+}
+
+function renderJrawPackets(frames) {
+  const body = $("packets-body");
+  body.innerHTML = "";
+  $("packet-count").textContent = `${frames.length} shown`;
+  if (!frames.length) {
+    const row = document.createElement("tr");
+    const cell = element("td", "muted", "No frames yet.");
+    cell.colSpan = 13;
+    row.appendChild(cell);
+    body.appendChild(row);
+    return;
+  }
+
+  for (const frame of frames) {
+    const row = document.createElement("tr");
+    const time = element("td", "", fmtAgo(frame.received_at));
+    time.title = `${fmtTime(frame.received_at)} · seq ${frame.sequence}`;
+    row.appendChild(time);
+    row.appendChild(element("td", "", gatewayLabel(frame.gateway_id)));
+    row.appendChild(element("td", "", frame.route_name || "—"));
+    row.appendChild(element("td", "", frame.payload_name || frame.kind_name));
+    const contents = element("td", "packet-contents", jrawContents(frame));
+    contents.title = contents.textContent;
+    row.appendChild(contents);
+    const path = element(
+      "td",
+      "mono",
+      frame.path_hex
+        ? `${frame.path_hex} (${frame.path_hash_size ?? "?"}B hash)`
+        : frame.path_hash_size == null
+          ? "—"
+          : `(${frame.path_hash_size}B hash)`,
+    );
+    row.appendChild(path);
+    row.appendChild(element("td", "", frame.node_name || "—"));
+    row.appendChild(element("td", "mono", frame.sender_hash || "—"));
+    row.appendChild(
+      element(
+        "td",
+        "mono",
+        frame.channel_hash == null
+          ? "—"
+          : `0x${Number(frame.channel_hash).toString(16).padStart(2, "0")}`,
+      ),
+    );
+    row.appendChild(element("td", "num", fmtBytes(frame.frame_len)));
+    row.appendChild(element("td", "num", fmtSnr(frame.rx_snr)));
+    row.appendChild(element("td", "num", fmtRssi(frame.rx_rssi)));
+    const source = element("td", "muted", frame.source === "mqtt" ? "MQTT" : "PHY");
+    row.appendChild(source);
+    body.appendChild(row);
+  }
+}
+
+function jrawContents(frame) {
+  if (frame.payload_text) return frame.payload_text;
+  if (frame.node_type != null) return meshCoreNodeTypeLabel(frame.node_type);
+  if (frame.payload_name === "TXT_MSG" || frame.payload_name === "GRP_TXT") return "encrypted";
+  return "—";
 }
 
 function renderPackets(packets) {
@@ -1219,10 +1587,74 @@ function renderNodes() {
   }
 }
 
+const NODE_MT_FILTER_IDS = [
+  "node-search",
+  "node-role-filter",
+  "node-via-filter",
+  "node-hardware-filter",
+  "node-channel-filter",
+];
+
 async function loadNodes() {
-  state.nodes = await loadNodeNames();
+  const family = state.nodeFamily;
+  const isMeshtastic = family === "mt";
+  for (const id of NODE_MT_FILTER_IDS) $(id).hidden = !isMeshtastic;
+  $("nodes-mt-table").hidden = !isMeshtastic;
+  $("nodes-jraw-table").hidden = isMeshtastic;
+
+  if (!isMeshtastic) {
+    await loadNodeNames();
+    const kind = family === "mc" ? 1 : 2;
+    const nodes = await getJson(`/api/jraw-nodes?kind=${kind}&limit=500`);
+    renderJrawNodes(nodes);
+    return;
+  }
+
+  state.nodes = await getJson("/api/nodes");
+  state.nodeNames = new Map(state.nodes.map((node) => [Number(node.num), nodeLabel(node)]));
   populateNodeFilters();
   renderNodes();
+}
+
+function renderJrawNodes(nodes) {
+  const body = $("nodes-jraw-body");
+  body.innerHTML = "";
+  $("nodes-count").textContent = `${nodes.length} nodes`;
+  if (!nodes.length) {
+    const row = document.createElement("tr");
+    const cell = element("td", "muted", "No nodes heard yet.");
+    cell.colSpan = 8;
+    row.appendChild(cell);
+    body.appendChild(row);
+    return;
+  }
+
+  for (const node of nodes) {
+    const row = document.createElement("tr");
+    row.appendChild(element("td", "", node.name || node.node_hash));
+    row.appendChild(element("td", "mono", node.node_hash));
+    row.appendChild(
+      element(
+        "td",
+        "",
+        node.kind === 1
+          ? meshCoreNodeTypeLabel(node.node_type)
+          : node.node_type == null
+            ? node.kind_name
+            : `${node.kind_name} type ${node.node_type}`,
+      ),
+    );
+    row.appendChild(element("td", "", node.gateway_name || node.gateway_id));
+    row.appendChild(element("td", "num", fmtNum(node.frames)));
+    const first = element("td", "", fmtAgo(node.first_heard));
+    first.title = fmtTime(node.first_heard);
+    row.appendChild(first);
+    const last = element("td", "", fmtAgo(node.last_heard));
+    last.title = fmtTime(node.last_heard);
+    row.appendChild(last);
+    row.appendChild(element("td", "mono", node.public_key ? `${node.public_key.slice(0, 16)}…` : "—"));
+    body.appendChild(row);
+  }
 }
 
 function fact(label, value) {
@@ -1271,6 +1703,13 @@ function renderNodeDetail(body, data) {
   facts.appendChild(positionFact);
   body.appendChild(facts);
 
+  const signalHeading = element("h3", "", "Signal by source");
+  signalHeading.style.fontSize = "14px";
+  body.appendChild(signalHeading);
+  const signalBody = element("div", "signal-body");
+  body.appendChild(signalBody);
+  loadNodeSignalGraph(signalBody, node.num);
+
   const heading = element("h3", "", `Packets sent (${data.packets.length})`);
   heading.style.fontSize = "14px";
   body.appendChild(heading);
@@ -1312,6 +1751,150 @@ function renderNodeDetail(body, data) {
   table.appendChild(tbody);
   wrap.appendChild(table);
   body.appendChild(wrap);
+}
+
+function svgElement(tag, attributes = {}) {
+  const node = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [key, value] of Object.entries(attributes)) node.setAttribute(key, value);
+  return node;
+}
+
+function renderSignalTrack(svg, receptions, metric, label, color, top) {
+  const chartLeft = 50;
+  const chartRight = 510;
+  const height = 38;
+  const values = receptions.filter((reception) => reception[metric.key] != null);
+  svg.appendChild(
+    svgElement("text", { x: 8, y: top + 14, fill: color, "font-size": "10" }),
+  ).textContent = label;
+  if (!values.length) {
+    svg.appendChild(
+      svgElement("text", { x: chartLeft, y: top + 18, "font-size": "10" }),
+    ).textContent = "no data";
+    return;
+  }
+
+  const numericValues = values.map((reception) => Number(reception[metric.key]));
+  let min;
+  let max;
+  let clipped = false;
+  if (metric.centerZero) {
+    const bound = Math.max(1, percentile(numericValues.map((value) => Math.abs(value)), 0.9));
+    min = -bound;
+    max = bound;
+    clipped = numericValues.some((value) => Math.abs(value) > bound);
+    metric.scaleBounds = { min, max, clipped };
+  } else {
+    min = Math.min(...numericValues);
+    max = Math.max(...numericValues);
+    if (min === max) {
+      min -= 1;
+      max += 1;
+    }
+  }
+  const first = receptions[0].received_at;
+  const last = receptions[receptions.length - 1].received_at;
+  const span = Math.max(1, last - first);
+  const points = values.map((reception) => {
+    const x = chartLeft + ((reception.received_at - first) / span) * (chartRight - chartLeft);
+    const value = Math.max(min, Math.min(max, Number(reception[metric.key])));
+    const y = top + height - ((value - min) / (max - min)) * height;
+    return [x, y, reception];
+  });
+  const path = points
+    .map(([x, y], index) => `${index === 0 ? "M" : "L"}${x.toFixed(1)},${y.toFixed(1)}`)
+    .join(" ");
+  svg.appendChild(
+    svgElement("path", { d: path, fill: "none", stroke: color, "stroke-width": "1.8" }),
+  );
+  for (const [x, y, reception] of points) {
+    const circle = svgElement("circle", { cx: x, cy: y, r: 2.4, fill: color });
+    const title = svgElement("title");
+    title.textContent = `${fmtTime(reception.received_at)} · ${metric.format(reception[metric.key])}`;
+    circle.appendChild(title);
+    svg.appendChild(circle);
+  }
+  svg.appendChild(
+    svgElement("text", { x: chartLeft, y: top + 10, "font-size": "9" }),
+  ).textContent = metric.format(max);
+  svg.appendChild(
+    svgElement("text", { x: chartLeft, y: top + height + 2, "font-size": "9" }),
+  ).textContent = metric.format(min);
+}
+
+function renderSignalLegend(samples, metrics) {
+  const legend = element("div", "signal-legend");
+  for (const metric of metrics) {
+    const values = samples
+      .map((sample) => sample[metric.key])
+      .filter((value) => value != null)
+      .map(Number);
+    if (!values.length) continue;
+    const min = Math.min(...values);
+    const max = Math.max(...values);
+    const avg = values.reduce((sum, value) => sum + value, 0) / values.length;
+    const stddev = Math.sqrt(
+      values.reduce((sum, value) => sum + (value - avg) ** 2, 0) / values.length,
+    );
+    const last = values[values.length - 1];
+    const entry = element("div", "legend-entry");
+    const swatch = element("span", "legend-swatch");
+    swatch.style.background = metric.color;
+    entry.appendChild(swatch);
+    entry.appendChild(element("span", "", metric.label));
+    entry.appendChild(
+      element(
+        "span",
+        "muted",
+        `last ${metric.format(last)} · min ${metric.format(min)} · max ${metric.format(max)} · avg ${metric.format(avg)} · σ ${metric.format(stddev)}${metric.scaleBounds?.clipped ? ` · scale ±${metric.format(metric.scaleBounds.max)}` : ""}`,
+      ),
+    );
+    legend.appendChild(entry);
+  }
+  return legend;
+}
+
+function renderNodeSignalGraph(container, receptions) {
+  const groups = new Map();
+  for (const reception of receptions) {
+    const key = reception.receiver || "unknown";
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(reception);
+  }
+  if (!groups.size) {
+    container.appendChild(empty("No per-source signal history yet."));
+    return;
+  }
+
+  for (const [receiver, sourceReceptions] of groups) {
+    sourceReceptions.sort((left, right) => left.received_at - right.received_at);
+    const block = element("div", "signal-source");
+    const title = element("div", "signal-source-title");
+    title.appendChild(element("strong", "", gatewayLabel(receiver)));
+    title.appendChild(element("span", "muted", `${sourceReceptions.length} receptions`));
+    block.appendChild(title);
+    const svg = svgElement("svg", { class: "signal-chart", viewBox: "0 0 520 150" });
+    const signalMetrics = SIGNAL_METRICS.map((metric) => ({ ...metric }));
+    signalMetrics.forEach((metric, index) => {
+      renderSignalTrack(svg, sourceReceptions, metric, metric.label, metric.color, 8 + index * 50);
+    });
+    block.appendChild(svg);
+    const legend = renderSignalLegend(sourceReceptions, signalMetrics);
+    if (legend.childElementCount) block.appendChild(legend);
+    container.appendChild(block);
+  }
+}
+
+async function loadNodeSignalGraph(container, nodeNum) {
+  container.appendChild(empty("loading signal history…"));
+  try {
+    const receptions = await getJson(`/api/receptions?from_num=${encodeURIComponent(nodeNum)}&limit=1000`);
+    container.innerHTML = "";
+    renderNodeSignalGraph(container, receptions);
+  } catch (error) {
+    container.innerHTML = "";
+    container.appendChild(empty(`could not load signal history: ${error.message}`));
+  }
 }
 
 function renderNodeDialog(data) {
@@ -1398,6 +1981,9 @@ function renderRaw(frames) {
     add("payload", frame.payload_name);
     add("node", frame.node_name);
     add("path", frame.path_hex);
+    add("path hash size", frame.path_hash_size == null ? null : `${frame.path_hash_size} B`);
+    add("node type", frame.node_type == null ? null : meshCoreNodeTypeLabel(frame.node_type));
+    add("text", frame.payload_text);
     add("sender", frame.sender_hash);
     add("destination", frame.destination_hash);
     add("channel hash", frame.channel_hash == null ? null : `0x${Number(frame.channel_hash).toString(16).padStart(2, "0")}`);
@@ -1485,27 +2071,30 @@ async function refreshActive(force = false) {
   if (!force && state.tab === "traces" && document.querySelector("#traces-list details[open]")) return;
   state.refreshing = true;
   try {
-    const data = await getJson("/api/stats");
-    renderStatus(data.status);
-    if (state.tab === "stats") {
-      renderStats(data);
-    } else if (state.tab === "chat") {
-      await loadChannels();
-      await loadChat();
-    } else if (state.tab === "nodes") {
-      await loadNodes();
-    } else if (state.tab === "packets") {
-      await loadPackets();
-    } else if (state.tab === "channels") {
-      renderChannels(data.stats.channels);
-    } else if (state.tab === "raw") {
-      await loadRaw();
-    } else if (state.tab === "receptions") {
-      await loadReceptions();
-    } else if (state.tab === "traces") {
-      await loadTraces();
-    } else if (state.tab === "sources") {
-      renderSources(data.status.sources || []);
+    if (state.tab === "stats" || state.tab === "channels") {
+      const data = await getJson("/api/stats");
+      renderStatus(data.status);
+      if (state.tab === "stats") renderStats(data);
+      else renderChannels(data.stats.channels);
+    } else {
+      const status = await getJson("/api/status");
+      renderStatus(status);
+      if (state.tab === "chat") {
+        await loadChannels();
+        await loadChat();
+      } else if (state.tab === "nodes") {
+        await loadNodes();
+      } else if (state.tab === "packets") {
+        await loadPackets();
+      } else if (state.tab === "raw") {
+        await loadRaw();
+      } else if (state.tab === "receptions") {
+        await loadReceptions();
+      } else if (state.tab === "traces") {
+        await loadTraces();
+      } else if (state.tab === "sources") {
+        renderSources(status.sources || []);
+      }
     }
     $("last-refresh").textContent = `updated ${new Date().toLocaleTimeString()}`;
   } catch (error) {
@@ -1546,6 +2135,7 @@ function bind() {
   $("channels-refresh").addEventListener("click", () => refreshActive(true));
   $("sources-refresh").addEventListener("click", () => refreshActive(true));
   for (const [id, key] of [
+    ["packet-family", "packetFamily"],
     ["packet-protocol", "packetProtocol"],
     ["packet-channel", "packetChannel"],
     ["packet-gateway", "packetGateway"],
@@ -1558,6 +2148,10 @@ function bind() {
     });
   }
   $("packet-refresh").addEventListener("click", loadPackets);
+  $("node-family").addEventListener("change", (event) => {
+    state.nodeFamily = event.target.value;
+    loadNodes();
+  });
   $("node-search").addEventListener("input", (event) => {
     state.nodeSearch = event.target.value;
     renderNodes();

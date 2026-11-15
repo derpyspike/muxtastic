@@ -285,12 +285,115 @@ pub fn feed_topic(root: &str, region: &str, gateway: u32) -> String {
     format!("{root}/{region}/!{gateway:08x}")
 }
 
+/// The parts of a Reticulum packet that can be read without its keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReticulumInfo {
+    pub packet_type: u8,
+    pub context: u8,
+    pub hops: u8,
+    pub destination_hash: String,
+    pub public_key: Option<Vec<u8>>,
+    pub node_name: Option<String>,
+}
+
+pub fn reticulum_packet_type_name(packet_type: u8) -> &'static str {
+    match packet_type {
+        0 => "DATA",
+        1 => "ANNOUNCE",
+        2 => "LINKREQUEST",
+        3 => "PROOF",
+        _ => "UNKNOWN",
+    }
+}
+
+pub fn reticulum_context_name(context: u8) -> &'static str {
+    match context {
+        0x00 => "NONE",
+        0x01 => "RESOURCE",
+        0x02 => "RESOURCE_ADV",
+        0x03 => "RESOURCE_REQ",
+        0x04 => "RESOURCE_HMU",
+        0x05 => "RESOURCE_PRF",
+        0x06 => "RESOURCE_ICL",
+        0x07 => "RESOURCE_RCL",
+        0x08 => "CACHE_REQUEST",
+        0x09 => "REQUEST",
+        0x0A => "RESPONSE",
+        0x0B => "PATH_RESPONSE",
+        0x0C => "COMMAND",
+        0x0D => "COMMAND_STATUS",
+        0x0E => "CHANNEL",
+        0xFA => "KEEPALIVE",
+        0xFB => "LINKIDENTIFY",
+        0xFC => "LINKCLOSE",
+        0xFD => "LINKPROOF",
+        0xFE => "LRRTT",
+        0xFF => "LRPROOF",
+        _ => "UNKNOWN",
+    }
+}
+
+/// Parse the fixed header of a Reticulum packet. Announce payloads expose the
+/// destination hash, public key and any printable app-data name.
+pub fn parse_reticulum_frame(frame: &[u8]) -> Option<ReticulumInfo> {
+    const DST_LEN: usize = 16;
+    if frame.len() < 2 + DST_LEN + 1 {
+        return None;
+    }
+    let flags = frame[0];
+    let header_type = (flags >> 6) & 0x03;
+    if header_type > 1 {
+        return None;
+    }
+    let packet_type = flags & 0x03;
+    let hops = frame[1];
+    let mut offset = 2;
+    if header_type == 1 {
+        offset += DST_LEN;
+    }
+    if frame.len() < offset + DST_LEN + 1 {
+        return None;
+    }
+    let destination_hash = hex(&frame[offset..offset + DST_LEN]);
+    offset += DST_LEN;
+    let context = frame[offset];
+    offset += 1;
+    let data = &frame[offset..];
+
+    let mut public_key = None;
+    let mut node_name = None;
+    if packet_type == 1 && data.len() >= 64 + 10 + 10 + 64 {
+        public_key = Some(data[..64].to_vec());
+        let with_ratchet = (flags & 0x20) != 0;
+        let app_at = 64 + 10 + 10 + 64 + if with_ratchet { 32 } else { 0 };
+        if let Some(app_data) = data.get(app_at..).filter(|bytes| !bytes.is_empty()) {
+            if let Ok(text) = std::str::from_utf8(app_data) {
+                let text = text.trim().trim_end_matches('\0');
+                if !text.is_empty() && text.chars().all(|ch| !ch.is_control()) {
+                    node_name = Some(text.to_owned());
+                }
+            }
+        }
+    }
+
+    Some(ReticulumInfo {
+        packet_type,
+        context,
+        hops,
+        destination_hash,
+        public_key,
+        node_name,
+    })
+}
+
 /// The parts of a MeshCore frame that can be read without its crypto keys.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeshCoreInfo {
     pub route_type: u8,
     pub payload_type: u8,
+    pub path_hash_size: u8,
     pub path_hex: String,
+    pub payload_text: Option<String>,
     pub sender_hash: Option<String>,
     pub destination_hash: Option<String>,
     pub channel_hash: Option<u8>,
@@ -375,14 +478,23 @@ pub fn parse_meshcore_frame(frame: &[u8]) -> Option<MeshCoreInfo> {
     let mut public_key = None;
     let mut node_name = None;
     let mut node_type = None;
+    let mut payload_text = None;
 
     const ADVERT_APP_DATA_AT: usize = 32 + 4 + 64;
     match payload_type {
         0x02 | 0x08 if payload.len() >= 2 => {
             destination_hash = Some(hex(&payload[0..1]));
             sender_hash = Some(hex(&payload[1..2]));
+            if payload_type == 0x02 {
+                payload_text = printable_text(&payload[2..]);
+            }
         }
-        0x05 => channel_hash = payload.first().copied(),
+        0x05 => {
+            channel_hash = payload.first().copied();
+            if payload.len() > 1 {
+                payload_text = printable_text(&payload[1..]);
+            }
+        }
         0x04 if payload.len() > ADVERT_APP_DATA_AT => {
             let flags = payload[ADVERT_APP_DATA_AT];
             node_type = Some(flags & 0x0F);
@@ -414,7 +526,9 @@ pub fn parse_meshcore_frame(frame: &[u8]) -> Option<MeshCoreInfo> {
     Some(MeshCoreInfo {
         route_type,
         payload_type,
+        path_hash_size: hash_size,
         path_hex,
+        payload_text,
         sender_hash,
         destination_hash,
         channel_hash,
@@ -422,6 +536,18 @@ pub fn parse_meshcore_frame(frame: &[u8]) -> Option<MeshCoreInfo> {
         node_name,
         node_type,
     })
+}
+
+fn printable_text(bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes)
+        .ok()?
+        .trim()
+        .trim_end_matches('\0');
+    if text.is_empty() || text.chars().any(|ch| ch.is_control()) {
+        None
+    } else {
+        Some(text.to_owned())
+    }
 }
 
 #[cfg(test)]
@@ -612,8 +738,10 @@ mod tests {
         assert_eq!(info.route_type, 1);
         assert_eq!(info.payload_type, 2);
         assert_eq!(info.path_hex, "");
+        assert_eq!(info.path_hash_size, 1);
         assert_eq!(info.destination_hash.as_deref(), Some("aa"));
         assert_eq!(info.sender_hash.as_deref(), Some("bb"));
+        assert_eq!(info.payload_text.as_deref(), Some("hi"));
         assert_eq!(meshcore_route_name(1), "flood");
         assert_eq!(meshcore_payload_name(2), "TXT_MSG");
 
@@ -623,6 +751,10 @@ mod tests {
         assert_eq!(info.payload_type, 5);
         assert_eq!(info.channel_hash, Some(0x7F));
         assert_eq!(meshcore_payload_name(5), "GRP_TXT");
+
+        let text = [0x15, 0x00, 0x7F, b'h', b'i'];
+        let info = parse_meshcore_frame(&text).expect("parse group text");
+        assert_eq!(info.payload_text.as_deref(), Some("hi"));
     }
 
     #[test]
@@ -635,10 +767,28 @@ mod tests {
         let info = parse_meshcore_frame(&frame).expect("parse advert");
         assert_eq!(info.payload_type, 4);
         assert_eq!(info.path_hex, "1122");
+        assert_eq!(info.path_hash_size, 1);
         assert_eq!(info.node_name.as_deref(), Some("Node"));
 
         assert!(parse_meshcore_frame(&[0x80, 0x00]).is_none()); // version bits set
         assert!(parse_meshcore_frame(&[0x09, 0xC0]).is_none()); // reserved path mode
         assert!(parse_meshcore_frame(&[0x09]).is_none());
+    }
+    #[test]
+    fn parses_reticulum_announce_names() {
+        let mut frame = vec![0x01, 3]; // announce, 3 hops
+        frame.extend_from_slice(&[0xAB; 16]); // destination hash
+        frame.push(0x00); // context
+        frame.extend_from_slice(&[0x11; 64]); // public key
+        frame.extend_from_slice(&[0x22; 10]); // name hash
+        frame.extend_from_slice(&[0x33; 10]); // random hash
+        frame.extend_from_slice(&[0x44; 64]); // signature
+        frame.extend_from_slice(b"Test Node");
+        let info = parse_reticulum_frame(&frame).expect("parse announce");
+        assert_eq!(info.packet_type, 1);
+        assert_eq!(info.hops, 3);
+        assert_eq!(info.destination_hash, "abababababababababababababababab");
+        assert_eq!(info.node_name.as_deref(), Some("Test Node"));
+        assert_eq!(info.public_key.as_ref().map(Vec::len), Some(64));
     }
 }

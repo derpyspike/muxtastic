@@ -239,6 +239,15 @@ file = ""
         .expect("channel nodes")
         .is_empty());
 
+    let node_names: Value =
+        serde_json::from_str(&http_get(web_port, "/api/node-names").expect("node names request"))
+            .expect("node names json");
+    assert!(node_names
+        .as_array()
+        .expect("node names array")
+        .iter()
+        .any(|node| node["long_name"].as_str() == Some("Mock Node")));
+
     let nodes: Value =
         serde_json::from_str(&http_get(web_port, "/api/nodes").expect("nodes request"))
             .expect("nodes json");
@@ -284,6 +293,42 @@ file = ""
     assert!(!recent
         .as_array()
         .expect("recent receptions array")
+        .is_empty());
+
+    let node_receptions: Value = serde_json::from_str(
+        &http_get(
+            web_port,
+            &format!(
+                "/api/receptions?from_num={}&limit=10",
+                messages[0]["from_num"]
+            ),
+        )
+        .expect("node receptions request"),
+    )
+    .expect("node receptions json");
+    assert!(!node_receptions
+        .as_array()
+        .expect("node receptions array")
+        .is_empty());
+
+    let relay_stats: Value = serde_json::from_str(
+        &http_get(web_port, "/api/relay-stats?receiver=%2112345678&limit=10")
+            .expect("relay stats request"),
+    )
+    .expect("relay stats json");
+    let relay_stats = relay_stats.as_array().expect("relay stats array");
+    assert!(!relay_stats.is_empty());
+    assert_eq!(relay_stats[0]["relay_node"], 4);
+    assert!(relay_stats[0]["rssi"]["avg"].as_f64().is_some());
+
+    let relay_series: Value = serde_json::from_str(
+        &http_get(web_port, "/api/relay-series?receiver=%2112345678&limit=100")
+            .expect("relay series request"),
+    )
+    .expect("relay series json");
+    assert!(!relay_series
+        .as_array()
+        .expect("relay series array")
         .is_empty());
 
     let node_page =
@@ -342,6 +387,14 @@ file = ""
         .expect("gateway filters")
         .is_empty());
 
+    let jraw_nodes: Value = serde_json::from_str(
+        &http_get(web_port, "/api/jraw-nodes?kind=1").expect("jraw nodes request"),
+    )
+    .expect("jraw nodes json");
+    let jraw_nodes = jraw_nodes.as_array().expect("jraw nodes array");
+    assert!(!jraw_nodes.is_empty());
+    assert_eq!(jraw_nodes[0]["kind_name"], "MeshCore");
+
     let raw: Value =
         serde_json::from_str(&http_get(web_port, "/api/raw?kind=1").expect("raw request"))
             .expect("raw json");
@@ -350,6 +403,8 @@ file = ""
     assert_eq!(raw[0]["kind_name"], "jencore");
     assert_eq!(raw[0]["source"], "physical");
     assert_eq!(raw[0]["payload_name"], "TXT_MSG");
+    assert_eq!(raw[0]["payload_text"], "mock");
+    assert_eq!(raw[0]["path_hash_size"], 1);
     assert_eq!(raw[0]["frame_hex"], "0900abcd6d6f636b");
     assert_eq!(raw[0]["frequency_error"], -42.0);
     assert_eq!(raw[0]["coding_rate"], 4);
@@ -359,6 +414,7 @@ file = ""
     assert!(page.contains("Mesh Stats"));
     assert!(page.contains("Packets"));
     assert!(page.contains("packets-body"));
+    assert!(page.contains("node-family"));
     assert!(page.contains("Channels"));
     assert!(page.contains("Sources"));
     assert!(page.contains("Traces"));

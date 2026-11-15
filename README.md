@@ -39,7 +39,10 @@ App N ─┘                  Rust/Tokio
 - MQTT proxy relay, raw gateway, standard mirror, optional second broker
 - SQLite history and dashboard: Stats, Chat, Nodes, Packets, Channels, Raw,
   Receptions, Traces, Sources
+- Packet and node family switches for Meshtastic, MeshCore and Reticulum
+- MeshCore/Reticulum advert tracking and repeated-reception counts in Chat
 - Per-gateway receptions, channel scoping, gateway-name resolution
+- Per-source RSSI/SNR/Δf graphs and relay-node signal statistics
 - Sources dropdowns for direct nodes, MQTT gateways and connected clients
   (peer, connected/idle time, RX/TX)
 - Extra channel decryption (base64 PSKs, one-byte keys, `*` wildcards)
@@ -101,6 +104,7 @@ enabled = true
 host = "127.0.0.1"
 port = 8080
 database = "data/muxtastic.db"
+storage = "sqlite"          # "sqlite" or "memory" (volatile)
 retention_days = 7
 ```
 

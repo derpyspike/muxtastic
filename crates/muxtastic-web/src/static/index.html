@@ -103,6 +103,11 @@
 
     <section id="tab-nodes" class="panel">
       <div class="toolbar">
+        <select id="node-family">
+          <option value="mt">Meshtastic</option>
+          <option value="mc">MeshCore</option>
+          <option value="rnode">Reticulum</option>
+        </select>
         <input id="node-search" type="search" placeholder="Filter nodes by name or id…">
         <select id="node-role-filter"><option value="">All roles</option></select>
         <select id="node-via-filter">
@@ -114,7 +119,7 @@
         <select id="node-channel-filter"><option value="">All channels</option></select>
         <span class="muted" id="nodes-count"></span>
       </div>
-      <div class="table-wrap">
+      <div class="table-wrap" id="nodes-mt-table">
         <table class="wide">
           <thead><tr>
             <th data-sort="name">Node</th><th data-sort="id">ID</th>
@@ -127,11 +132,25 @@
           <tbody id="nodes-body"></tbody>
         </table>
       </div>
+      <div class="table-wrap" id="nodes-jraw-table" hidden>
+        <table class="wide">
+          <thead><tr>
+            <th>Node</th><th>Hash</th><th>Type</th><th>Gateway</th>
+            <th class="num">Frames</th><th>First heard</th><th>Last heard</th><th>Public key</th>
+          </tr></thead>
+          <tbody id="nodes-jraw-body"></tbody>
+        </table>
+      </div>
     </section>
 
 
     <section id="tab-packets" class="panel">
       <div class="toolbar">
+        <select id="packet-family">
+          <option value="mt">Meshtastic</option>
+          <option value="mc">MeshCore</option>
+          <option value="rnode">Reticulum</option>
+        </select>
         <select id="packet-protocol"><option value="">All protocols</option></select>
         <select id="packet-channel"><option value="">All channels</option></select>
         <select id="packet-gateway"><option value="">All gateways</option></select>
@@ -151,7 +170,7 @@
       </div>
       <div class="table-wrap">
         <table class="wide">
-          <thead><tr>
+          <thead id="packets-head"><tr>
             <th>Time</th><th>From</th><th>To</th><th>Protocol</th><th>Contents</th>
             <th>Channel</th><th>Gateways</th><th class="num">Bytes</th>
             <th class="num">SNR</th><th class="num">RSSI</th><th>Source</th>

@@ -43,6 +43,7 @@ enabled = true
 host = "127.0.0.1"              # loopback by default; exposing it is your call
 port = 8080
 database = "data/muxtastic.db"  # SQLite file; connect with any sqlite client
+storage = "sqlite"              # "sqlite" or "memory" (volatile, no file)
 retention_days = 7              # prune packets/messages/raw/traces older than this; 0 = keep forever
 try_all_one_byte_keys = false   # append all 255 non-zero 1-byte PSKs to extra_channels
 

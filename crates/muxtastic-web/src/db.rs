@@ -16,7 +16,8 @@ use meshtastic::Message as ProstMessage;
 use muxtastic_core::channel_crypto::{self, ExtraChannel};
 use muxtastic_core::nexus::NexusDiagnostics;
 use muxtastic_core::raw_tunnel::{
-    meshcore_payload_name, meshcore_route_name, parse_chunk, parse_meshcore_frame, RawTunnelFrame,
+    meshcore_payload_name, meshcore_route_name, parse_chunk, parse_meshcore_frame,
+    parse_reticulum_frame, reticulum_context_name, reticulum_packet_type_name, RawTunnelFrame,
     RawTunnelKind,
 };
 use muxtastic_core::util::hex;
@@ -166,6 +167,11 @@ impl Database {
         nodes(&connection)
     }
 
+    pub fn query_node_names(&self) -> Result<Vec<NodeName>> {
+        let connection = self.conn.lock().unwrap_or_else(|error| error.into_inner());
+        node_names(&connection)
+    }
+
     pub fn query_raw_frames(&self, kind: Option<i64>, limit: usize) -> Result<Vec<RawFrame>> {
         let connection = self.conn.lock().unwrap_or_else(|error| error.into_inner());
         raw_frames(&connection, kind, limit)
@@ -204,6 +210,11 @@ impl Database {
     pub fn query_packet_filters(&self) -> Result<PacketFilterOptions> {
         let connection = self.conn.lock().unwrap_or_else(|error| error.into_inner());
         packet_filters(&connection)
+    }
+
+    pub fn query_jraw_nodes(&self, kind: Option<i64>, limit: usize) -> Result<Vec<JrawNode>> {
+        let connection = self.conn.lock().unwrap_or_else(|error| error.into_inner());
+        jraw_nodes(&connection, kind, limit)
     }
 
     /// Delete packet-derived history older than `days`; nodes/channels are kept.
@@ -245,6 +256,21 @@ impl Database {
     pub fn query_recent_receptions(&self, limit: usize) -> Result<Vec<Reception>> {
         let connection = self.conn.lock().unwrap_or_else(|error| error.into_inner());
         recent_receptions(&connection, limit)
+    }
+
+    pub fn query_node_receptions(&self, from_num: i64, limit: usize) -> Result<Vec<Reception>> {
+        let connection = self.conn.lock().unwrap_or_else(|error| error.into_inner());
+        node_receptions(&connection, from_num, limit)
+    }
+
+    pub fn query_relay_stats(&self, receiver: &str, limit: usize) -> Result<Vec<RelayStats>> {
+        let connection = self.conn.lock().unwrap_or_else(|error| error.into_inner());
+        relay_stats(&connection, receiver, limit)
+    }
+
+    pub fn query_relay_series(&self, receiver: &str, limit: usize) -> Result<Vec<RelaySample>> {
+        let connection = self.conn.lock().unwrap_or_else(|error| error.into_inner());
+        relay_series(&connection, receiver, limit)
     }
 }
 
@@ -328,7 +354,7 @@ CREATE TABLE IF NOT EXISTS packet_receptions (
     hop_start INTEGER,
     received_at INTEGER NOT NULL
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_receptions_packet_receiver
+CREATE INDEX IF NOT EXISTS idx_receptions_packet_receiver
     ON packet_receptions(from_num, packet_id, receiver) WHERE packet_id > 0;
 CREATE INDEX IF NOT EXISTS idx_receptions_packet
     ON packet_receptions(from_num, packet_id);
@@ -336,6 +362,8 @@ CREATE INDEX IF NOT EXISTS idx_receptions_received_at
     ON packet_receptions(received_at);
 CREATE INDEX IF NOT EXISTS idx_receptions_receiver
     ON packet_receptions(receiver);
+CREATE INDEX IF NOT EXISTS idx_receptions_receiver_time
+    ON packet_receptions(receiver, received_at, id);
 
 CREATE TABLE IF NOT EXISTS traceroutes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -407,6 +435,7 @@ CREATE TABLE IF NOT EXISTS nodes (
     updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_nodes_last_heard ON nodes(last_heard);
+CREATE INDEX IF NOT EXISTS idx_nodes_node_id ON nodes(node_id);
 
 CREATE TABLE IF NOT EXISTS channels (
     idx INTEGER PRIMARY KEY,
@@ -458,6 +487,22 @@ CREATE TABLE IF NOT EXISTS raw_frames (
 );
 CREATE INDEX IF NOT EXISTS idx_raw_received_at ON raw_frames(received_at);
 CREATE INDEX IF NOT EXISTS idx_raw_kind ON raw_frames(kind);
+CREATE INDEX IF NOT EXISTS idx_raw_kind_sender ON raw_frames(kind, sender_hash, received_at);
+CREATE INDEX IF NOT EXISTS idx_raw_kind_destination ON raw_frames(kind, destination_hash, received_at);
+
+CREATE TABLE IF NOT EXISTS jraw_nodes (
+    kind INTEGER NOT NULL,
+    node_hash TEXT NOT NULL,
+    name TEXT,
+    public_key BLOB,
+    node_type INTEGER,
+    first_heard INTEGER NOT NULL,
+    last_heard INTEGER NOT NULL,
+    frames INTEGER NOT NULL DEFAULT 0,
+    last_gateway INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (kind, node_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_jraw_nodes_last_heard ON jraw_nodes(last_heard);
 "#,
         )
         .context("failed to initialise the SQLite schema")?;
@@ -686,6 +731,8 @@ SET channel_name = COALESCE(
     '')
 WHERE channel_name = '';
 CREATE INDEX IF NOT EXISTS idx_packets_channel_name ON packets(channel_name);
+CREATE INDEX IF NOT EXISTS idx_packets_from_received ON packets(from_num, received_at, id);
+CREATE INDEX IF NOT EXISTS idx_packets_channel_name_from ON packets(channel_name, from_num);
 PRAGMA user_version = 10;
 "#,
         )?;
@@ -725,6 +772,86 @@ PRAGMA user_version = 10;
             "INTEGER NOT NULL DEFAULT 0",
         )?;
         connection.execute_batch("PRAGMA user_version = 11;")?;
+    }
+
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version < 12 {
+        connection.execute_batch(
+            r#"
+CREATE INDEX IF NOT EXISTS idx_raw_kind_sender
+    ON raw_frames(kind, sender_hash, received_at);
+CREATE INDEX IF NOT EXISTS idx_raw_kind_destination
+    ON raw_frames(kind, destination_hash, received_at);
+DROP INDEX IF EXISTS idx_receptions_packet_receiver;
+CREATE INDEX IF NOT EXISTS idx_receptions_packet_receiver
+    ON packet_receptions(from_num, packet_id, receiver) WHERE packet_id > 0;
+
+CREATE TABLE IF NOT EXISTS jraw_nodes (
+    kind INTEGER NOT NULL,
+    node_hash TEXT NOT NULL,
+    name TEXT,
+    public_key BLOB,
+    node_type INTEGER,
+    first_heard INTEGER NOT NULL,
+    last_heard INTEGER NOT NULL,
+    frames INTEGER NOT NULL DEFAULT 0,
+    last_gateway INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (kind, node_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_jraw_nodes_last_heard ON jraw_nodes(last_heard);
+
+INSERT OR IGNORE INTO jraw_nodes
+    (kind, node_hash, first_heard, last_heard, frames, last_gateway)
+SELECT kind, sender_hash, MIN(received_at), MAX(received_at), COUNT(*), MAX(gateway)
+FROM raw_frames
+WHERE kind = 1 AND sender_hash IS NOT NULL AND sender_hash <> ''
+GROUP BY sender_hash;
+
+UPDATE jraw_nodes SET
+    name = COALESCE(
+        (SELECT r.node_name FROM raw_frames r
+         WHERE r.kind = jraw_nodes.kind AND r.sender_hash = jraw_nodes.node_hash
+           AND r.node_name IS NOT NULL
+         ORDER BY r.received_at DESC LIMIT 1),
+        name),
+    public_key = COALESCE(
+        (SELECT r.public_key FROM raw_frames r
+         WHERE r.kind = jraw_nodes.kind AND r.sender_hash = jraw_nodes.node_hash
+           AND r.public_key IS NOT NULL
+         ORDER BY r.received_at DESC LIMIT 1),
+        public_key)
+WHERE kind = 1;
+
+INSERT OR IGNORE INTO jraw_nodes
+    (kind, node_hash, first_heard, last_heard, frames, last_gateway)
+SELECT kind, destination_hash, MIN(received_at), MAX(received_at), COUNT(*), MAX(gateway)
+FROM raw_frames
+WHERE kind = 2 AND destination_hash IS NOT NULL AND destination_hash <> ''
+GROUP BY destination_hash;
+PRAGMA user_version = 12;
+"#,
+        )?;
+    }
+
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version < 13 {
+        connection.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_nodes_node_id ON nodes(node_id);
+             CREATE INDEX IF NOT EXISTS idx_packets_from_received
+                 ON packets(from_num, received_at, id);
+             CREATE INDEX IF NOT EXISTS idx_packets_channel_name_from
+                 ON packets(channel_name, from_num);
+             PRAGMA user_version = 13;",
+        )?;
+    }
+
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version < 14 {
+        connection.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_receptions_receiver_time
+                 ON packet_receptions(receiver, received_at, id);
+             PRAGMA user_version = 14;",
+        )?;
     }
     Ok(())
 }
@@ -1067,7 +1194,7 @@ fn insert_reception(
     }
     let (frequency_error, coding_rate) = diagnostics_values(diagnostics);
     let inserted = connection.execute(
-        "INSERT OR IGNORE INTO packet_receptions
+        "INSERT INTO packet_receptions
          (packet_id, from_num, to_num, relay_node, channel, channel_name, decrypted,
           receiver, source, via_mqtt, rx_time, rx_snr, rx_rssi, rx_frequency_error,
           rx_coding_rate, hop_limit, hop_start, received_at)
@@ -1446,6 +1573,52 @@ fn apply_raw(connection: &Connection, raw: &RawTunnelFrame, now: i64) -> Result<
     } else {
         None
     };
+    let reticulum = if raw.kind == RawTunnelKind::RNode {
+        parse_reticulum_frame(&raw.frame)
+    } else {
+        None
+    };
+
+    let (
+        route_type,
+        payload_type,
+        route_name,
+        payload_name,
+        path_hex,
+        sender_hash,
+        destination_hash,
+        channel_hash,
+        node_name,
+        public_key,
+    ) = if let Some(info) = &meshcore {
+        (
+            Some(info.route_type as i64),
+            Some(info.payload_type as i64),
+            Some(meshcore_route_name(info.route_type).to_owned()),
+            Some(meshcore_payload_name(info.payload_type).to_owned()),
+            Some(info.path_hex.clone()),
+            info.sender_hash.clone(),
+            info.destination_hash.clone(),
+            info.channel_hash.map(i64::from),
+            info.node_name.clone(),
+            info.public_key.clone(),
+        )
+    } else if let Some(info) = &reticulum {
+        (
+            Some(i64::from(info.packet_type)),
+            Some(i64::from(info.context)),
+            Some(reticulum_packet_type_name(info.packet_type).to_owned()),
+            Some(reticulum_context_name(info.context).to_owned()),
+            None,
+            None,
+            Some(info.destination_hash.clone()),
+            None,
+            info.node_name.clone(),
+            info.public_key.clone(),
+        )
+    } else {
+        (None, None, None, None, None, None, None, None, None, None)
+    };
 
     connection.execute(
         "INSERT INTO raw_frames
@@ -1468,26 +1641,83 @@ fn apply_raw(connection: &Connection, raw: &RawTunnelFrame, now: i64) -> Result<
             raw.coding_rate.map(i64::from),
             raw.frame,
             raw.frame.len() as i64,
-            meshcore.as_ref().map(|info| info.route_type as i64),
-            meshcore.as_ref().map(|info| info.payload_type as i64),
-            meshcore
-                .as_ref()
-                .map(|info| meshcore_route_name(info.route_type)),
-            meshcore
-                .as_ref()
-                .map(|info| meshcore_payload_name(info.payload_type)),
-            meshcore.as_ref().map(|info| info.path_hex.clone()),
-            meshcore.as_ref().and_then(|info| info.sender_hash.clone()),
-            meshcore
-                .as_ref()
-                .and_then(|info| info.destination_hash.clone()),
-            meshcore
-                .as_ref()
-                .and_then(|info| info.channel_hash)
-                .map(|value| value as i64),
-            meshcore.as_ref().and_then(|info| info.node_name.clone()),
-            meshcore.as_ref().and_then(|info| info.public_key.clone()),
+            route_type,
+            payload_type,
+            route_name,
+            payload_name,
+            path_hex,
+            sender_hash,
+            destination_hash,
+            channel_hash,
+            node_name,
+            public_key,
             now,
+        ],
+    )?;
+
+    if let Some(info) = &meshcore {
+        if let Some(hash) = &info.sender_hash {
+            let advert = info.payload_type == 0x04;
+            upsert_jraw_node(
+                connection,
+                RawTunnelKind::MeshCore,
+                hash,
+                advert.then_some(info.node_name.as_deref()).flatten(),
+                advert.then_some(info.public_key.as_deref()).flatten(),
+                advert.then_some(info.node_type.map(i64::from)).flatten(),
+                raw.gateway,
+                now,
+            )?;
+        }
+    } else if let Some(info) = &reticulum {
+        if info.packet_type == 1 {
+            upsert_jraw_node(
+                connection,
+                RawTunnelKind::RNode,
+                &info.destination_hash,
+                info.node_name.as_deref(),
+                info.public_key.as_deref(),
+                None,
+                raw.gateway,
+                now,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upsert_jraw_node(
+    connection: &Connection,
+    kind: RawTunnelKind,
+    node_hash: &str,
+    name: Option<&str>,
+    public_key: Option<&[u8]>,
+    node_type: Option<i64>,
+    gateway: u32,
+    now: i64,
+) -> Result<()> {
+    connection.execute(
+        "INSERT INTO jraw_nodes
+         (kind, node_hash, name, public_key, node_type, first_heard, last_heard,
+          frames, last_gateway)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, 1, ?7)
+         ON CONFLICT(kind, node_hash) DO UPDATE SET
+            name = COALESCE(excluded.name, jraw_nodes.name),
+            public_key = COALESCE(excluded.public_key, jraw_nodes.public_key),
+            node_type = COALESCE(excluded.node_type, jraw_nodes.node_type),
+            last_heard = excluded.last_heard,
+            frames = jraw_nodes.frames + 1,
+            last_gateway = excluded.last_gateway",
+        params![
+            kind.wire_value() as i64,
+            node_hash,
+            name,
+            public_key,
+            node_type,
+            now,
+            gateway as i64,
         ],
     )?;
     Ok(())
@@ -1913,6 +2143,125 @@ fn recent_receptions(connection: &Connection, limit: usize) -> Result<Vec<Recept
     Ok(out)
 }
 
+fn node_receptions(connection: &Connection, from_num: i64, limit: usize) -> Result<Vec<Reception>> {
+    let limit = limit.clamp(1, 2000) as i64;
+    let mut statement = connection.prepare(&format!(
+        "SELECT {RECEPTION_COLUMNS}
+         FROM packet_receptions
+         WHERE from_num = ?1
+         ORDER BY received_at DESC, id DESC LIMIT ?2"
+    ))?;
+    let rows = statement.query_map(params![from_num, limit], reception_from_row)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+fn metric_stats(
+    min: Option<f64>,
+    max: Option<f64>,
+    sum: Option<f64>,
+    sum_squares: Option<f64>,
+    count: i64,
+) -> MetricStats {
+    if count <= 0 {
+        return MetricStats {
+            min: None,
+            max: None,
+            avg: None,
+            stddev: None,
+            count: 0,
+        };
+    }
+    let count_f = count as f64;
+    let sum = sum.unwrap_or(0.0);
+    let avg = sum / count_f;
+    let variance = (sum_squares.unwrap_or(0.0) / count_f - avg * avg).max(0.0);
+    MetricStats {
+        min,
+        max,
+        avg: Some(avg),
+        stddev: Some(variance.sqrt()),
+        count,
+    }
+}
+
+fn relay_series(connection: &Connection, receiver: &str, limit: usize) -> Result<Vec<RelaySample>> {
+    let limit = limit.clamp(1, 2000) as i64;
+    let mut statement = connection.prepare(
+        "SELECT relay_node & 255, received_at, rx_rssi, rx_snr, rx_frequency_error
+         FROM packet_receptions
+         WHERE receiver = ?1
+         ORDER BY received_at DESC, id DESC LIMIT ?2",
+    )?;
+    let rows = statement.query_map(params![receiver, limit], |row| {
+        Ok(RelaySample {
+            relay_node: row.get(0)?,
+            received_at: row.get(1)?,
+            rx_rssi: row.get(2)?,
+            rx_snr: row.get(3)?,
+            rx_frequency_error: row.get(4)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+fn relay_stats(connection: &Connection, receiver: &str, limit: usize) -> Result<Vec<RelayStats>> {
+    let limit = limit.clamp(1, 200) as i64;
+    let mut statement = connection.prepare(
+        "SELECT relay_node & 255 AS relay, COUNT(*),
+                MIN(rx_rssi), MAX(rx_rssi), SUM(rx_rssi), SUM(rx_rssi * rx_rssi), COUNT(rx_rssi),
+                MIN(rx_snr), MAX(rx_snr), SUM(rx_snr), SUM(rx_snr * rx_snr), COUNT(rx_snr),
+                MIN(rx_frequency_error), MAX(rx_frequency_error),
+                SUM(rx_frequency_error), SUM(rx_frequency_error * rx_frequency_error),
+                COUNT(rx_frequency_error)
+         FROM packet_receptions
+         WHERE receiver = ?1
+         GROUP BY relay
+         ORDER BY COUNT(*) DESC, relay
+         LIMIT ?2",
+    )?;
+    let rows = statement.query_map(params![receiver, limit], |row| {
+        let packets: i64 = row.get(1)?;
+        Ok(RelayStats {
+            relay_node: row.get(0)?,
+            packets,
+            rssi: metric_stats(
+                row.get::<_, Option<f64>>(2)?,
+                row.get::<_, Option<f64>>(3)?,
+                row.get::<_, Option<f64>>(4)?,
+                row.get::<_, Option<f64>>(5)?,
+                row.get::<_, i64>(6)?,
+            ),
+            snr: metric_stats(
+                row.get::<_, Option<f64>>(7)?,
+                row.get::<_, Option<f64>>(8)?,
+                row.get::<_, Option<f64>>(9)?,
+                row.get::<_, Option<f64>>(10)?,
+                row.get::<_, i64>(11)?,
+            ),
+            frequency_error: metric_stats(
+                row.get::<_, Option<f64>>(12)?,
+                row.get::<_, Option<f64>>(13)?,
+                row.get::<_, Option<f64>>(14)?,
+                row.get::<_, Option<f64>>(15)?,
+                row.get::<_, i64>(16)?,
+            ),
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 const NODE_COLUMNS: &str = "n.num, n.node_id, n.long_name, n.short_name, n.hw_model, n.role,
     n.last_heard, n.snr, n.hops_away, n.via_mqtt, n.battery_level, n.voltage,
     n.channel_utilization, n.air_util_tx, n.latitude_i, n.longitude_i, n.altitude,
@@ -1962,6 +2311,26 @@ fn node_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Node> {
     })
 }
 
+fn node_names(connection: &Connection) -> Result<Vec<NodeName>> {
+    let mut statement = connection.prepare(
+        "SELECT num, node_id, long_name, short_name FROM nodes
+         ORDER BY last_heard DESC, num",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(NodeName {
+            num: row.get(0)?,
+            node_id: row.get(1)?,
+            long_name: row.get(2)?,
+            short_name: row.get(3)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 fn mqtt_gateways(connection: &Connection, limit: usize) -> Result<Vec<MqttGateway>> {
     let limit = limit.clamp(1, 1000) as i64;
     let mut statement = connection.prepare(
@@ -1989,7 +2358,7 @@ fn mqtt_gateways(connection: &Connection, limit: usize) -> Result<Vec<MqttGatewa
          SELECT g.receiver, g.packets, g.last_heard,
                 n.num, n.node_id, n.long_name, n.short_name, n.hw_model
          FROM gateways g
-         LEFT JOIN nodes n ON printf('!%08x', n.num) = g.receiver
+         LEFT JOIN nodes n ON n.node_id = g.receiver
          ORDER BY g.last_heard DESC, g.receiver
          LIMIT ?1",
     )?;
@@ -2100,6 +2469,43 @@ fn packet_list(connection: &Connection, filter: &PacketFilter) -> Result<Vec<Pac
     Ok(out)
 }
 
+fn jraw_nodes(connection: &Connection, kind: Option<i64>, limit: usize) -> Result<Vec<JrawNode>> {
+    let limit = limit.clamp(1, 2000) as i64;
+    let mut statement = connection.prepare(
+        "SELECT j.kind, j.node_hash, j.name, j.node_type, j.public_key,
+                j.first_heard, j.last_heard, j.frames, j.last_gateway,
+                COALESCE(NULLIF(n.long_name, ''), NULLIF(n.short_name, ''),
+                         printf('!%08x', j.last_gateway))
+         FROM jraw_nodes j
+         LEFT JOIN nodes n ON n.num = j.last_gateway
+         WHERE (?1 IS NULL OR j.kind = ?1)
+         ORDER BY j.last_heard DESC, j.kind, j.node_hash LIMIT ?2",
+    )?;
+    let rows = statement.query_map(params![kind, limit], |row| {
+        let kind: i64 = row.get(0)?;
+        let gateway: i64 = row.get(8)?;
+        Ok(JrawNode {
+            kind,
+            kind_name: if kind == 1 { "MeshCore" } else { "Reticulum" }.to_owned(),
+            node_hash: row.get(1)?,
+            name: row.get(2)?,
+            node_type: row.get(3)?,
+            public_key: row.get::<_, Option<Vec<u8>>>(4)?.map(|key| hex(&key)),
+            first_heard: row.get(5)?,
+            last_heard: row.get(6)?,
+            frames: row.get(7)?,
+            gateway,
+            gateway_id: format!("!{:08x}", gateway as u32),
+            gateway_name: row.get(9)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 fn packet_filters(connection: &Connection) -> Result<PacketFilterOptions> {
     let mut portnums = Vec::new();
     let mut statement = connection.prepare(
@@ -2123,7 +2529,7 @@ fn packet_filters(connection: &Connection) -> Result<PacketFilterOptions> {
                 COALESCE(NULLIF(n.long_name, ''), NULLIF(n.short_name, ''), r.receiver),
                 COUNT(*)
          FROM packet_receptions r
-         LEFT JOIN nodes n ON printf('!%08x', n.num) = r.receiver
+         LEFT JOIN nodes n ON n.node_id = r.receiver
          WHERE r.receiver <> ''
          GROUP BY r.receiver
          ORDER BY COUNT(*) DESC, r.receiver",
@@ -2294,6 +2700,12 @@ fn raw_frames(connection: &Connection, kind: Option<i64>, limit: usize) -> Resul
     )?;
     let rows = statement.query_map(params![kind, limit], |row| {
         let kind: i64 = row.get(1)?;
+        let frame_bytes = row.get::<_, Vec<u8>>(11)?;
+        let meshcore = if kind == 1 {
+            parse_meshcore_frame(&frame_bytes)
+        } else {
+            None
+        };
         Ok(RawFrame {
             id: row.get(0)?,
             kind,
@@ -2315,12 +2727,18 @@ fn raw_frames(connection: &Connection, kind: Option<i64>, limit: usize) -> Resul
             frequency_error: row.get(9)?,
             coding_rate: row.get(10)?,
             frame_len: row.get(12)?,
-            frame_hex: hex(&row.get::<_, Vec<u8>>(11)?),
+            frame_hex: hex(&frame_bytes),
             route_type: row.get(13)?,
             payload_type: row.get(14)?,
             route_name: row.get(15)?,
             payload_name: row.get(16)?,
             path_hex: row.get(17)?,
+            path_hash_size: meshcore.as_ref().map(|info| i64::from(info.path_hash_size)),
+            payload_text: meshcore.as_ref().and_then(|info| info.payload_text.clone()),
+            node_type: meshcore
+                .as_ref()
+                .and_then(|info| info.node_type)
+                .map(i64::from),
             sender_hash: row.get(18)?,
             destination_hash: row.get(19)?,
             channel_hash: row.get(20)?,
@@ -2532,6 +2950,33 @@ pub struct Message {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct MetricStats {
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+    pub avg: Option<f64>,
+    pub stddev: Option<f64>,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RelayStats {
+    pub relay_node: i64,
+    pub packets: i64,
+    pub rssi: MetricStats,
+    pub snr: MetricStats,
+    pub frequency_error: MetricStats,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RelaySample {
+    pub relay_node: i64,
+    pub received_at: i64,
+    pub rx_rssi: Option<f64>,
+    pub rx_snr: Option<f64>,
+    pub rx_frequency_error: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct Reception {
     pub id: i64,
     pub packet_id: i64,
@@ -2603,6 +3048,30 @@ pub struct PacketListEntry {
     pub reception_count: i64,
     pub gateway_count: i64,
     pub gateways: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeName {
+    pub num: i64,
+    pub node_id: Option<String>,
+    pub long_name: Option<String>,
+    pub short_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct JrawNode {
+    pub kind: i64,
+    pub kind_name: String,
+    pub node_hash: String,
+    pub name: Option<String>,
+    pub node_type: Option<i64>,
+    pub public_key: Option<String>,
+    pub first_heard: i64,
+    pub last_heard: i64,
+    pub frames: i64,
+    pub gateway: i64,
+    pub gateway_id: String,
+    pub gateway_name: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2726,6 +3195,9 @@ pub struct RawFrame {
     pub payload_type: Option<i64>,
     pub payload_name: Option<String>,
     pub path_hex: Option<String>,
+    pub path_hash_size: Option<i64>,
+    pub payload_text: Option<String>,
+    pub node_type: Option<i64>,
     pub sender_hash: Option<String>,
     pub destination_hash: Option<String>,
     pub channel_hash: Option<i64>,
@@ -2985,7 +3457,7 @@ mod tests {
             "!00000002",
         ))
         .unwrap();
-        // Duplicate transmission by the same receiver is ignored.
+        // A repeat from the same receiver is another reception.
         db.apply(write_reception(
             with_snr(text_packet(30, 42, 0, "multi"), 1.0),
             None,
@@ -2996,26 +3468,49 @@ mod tests {
 
         let stats = db.query_stats().unwrap();
         assert_eq!(stats.totals.packets, 1);
-        assert_eq!(stats.totals.receptions, 2);
+        assert_eq!(stats.totals.receptions, 3);
         assert_eq!(stats.totals.multi_heard, 1);
 
         let messages = db.query_messages(None, 10).unwrap();
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].reception_count, 2);
+        assert_eq!(messages[0].reception_count, 3);
         assert_eq!(messages[0].gateway_count, 2);
         assert_eq!(messages[0].best_snr, Some(9.0));
         assert_eq!(messages[0].relay_node, 0xABCD_0002);
 
         let receptions = db.query_receptions(42, 30).unwrap();
-        assert_eq!(receptions.len(), 2);
+        assert_eq!(receptions.len(), 3);
         assert_eq!(receptions[0].receiver, "!00000002");
         assert_eq!(receptions[0].relay_node, 0xABCD_0002);
         assert_eq!(receptions[0].rx_snr, Some(9.0));
         assert_eq!(receptions[0].rx_frequency_error, Some(-50.0));
         assert_eq!(receptions[0].rx_coding_rate, Some(3));
         assert_eq!(receptions[1].receiver, "!00000001");
+        assert_eq!(receptions[1].rx_snr, Some(4.0));
         assert_eq!(receptions[1].rx_frequency_error, Some(-100.0));
         assert_eq!(receptions[1].rx_coding_rate, Some(2));
+        assert_eq!(receptions[2].receiver, "!00000001");
+        assert_eq!(receptions[2].rx_snr, Some(1.0));
+        assert!(receptions[2].rx_frequency_error.is_none());
+
+        let by_node = db.query_node_receptions(42, 10).unwrap();
+        assert_eq!(by_node.len(), 3);
+
+        let relays = db.query_relay_stats("!00000001", 10).unwrap();
+        assert_eq!(relays.len(), 1);
+        assert_eq!(relays[0].relay_node, 2);
+        assert_eq!(relays[0].packets, 2);
+        assert_eq!(relays[0].rssi.min, Some(-70.0));
+        assert_eq!(relays[0].rssi.max, Some(-70.0));
+        assert_eq!(relays[0].rssi.avg, Some(-70.0));
+        assert_eq!(relays[0].snr.count, 2);
+        assert_eq!(relays[0].snr.avg, Some(2.5));
+        assert_eq!(relays[0].snr.stddev, Some(1.5));
+        assert_eq!(relays[0].frequency_error.count, 1);
+
+        let series = db.query_relay_series("!00000001", 10).unwrap();
+        assert_eq!(series.len(), 2);
+        assert!(series.iter().all(|sample| sample.relay_node == 2));
     }
 
     fn channel_frame(index: i32, name: &str) -> pb::FromRadio {
@@ -3552,6 +4047,54 @@ mod tests {
     }
 
     #[test]
+    fn records_jraw_nodes_from_adverts() {
+        let db = database();
+        let mut advert = vec![(4 << 2) | 2, 0x02, 0x11, 0x22];
+        advert.extend_from_slice(&[0u8; 100]);
+        advert.push(0x80);
+        advert.extend_from_slice(b"Node");
+        let raw = |kind, frame| {
+            DbWrite::Raw(Box::new(RawTunnelFrame {
+                kind,
+                source: RawTunnelSource::Physical,
+                sequence: 1,
+                frame,
+                gateway: 0x1122_3344,
+                channel: 0,
+                rx_time: 100,
+                rssi: Some(-60),
+                snr: Some(5.0),
+                frequency_error: None,
+                coding_rate: None,
+            }))
+        };
+        db.apply(raw(RawTunnelKind::MeshCore, advert.clone()))
+            .unwrap();
+        db.apply(raw(RawTunnelKind::MeshCore, advert)).unwrap();
+
+        let mut announce = vec![0x01, 3];
+        announce.extend_from_slice(&[0xAB; 16]);
+        announce.push(0x00);
+        announce.extend_from_slice(&[0x11; 64]);
+        announce.extend_from_slice(&[0x22; 10]);
+        announce.extend_from_slice(&[0x33; 10]);
+        announce.extend_from_slice(&[0x44; 64]);
+        announce.extend_from_slice(b"Reticulum Node");
+        db.apply(raw(RawTunnelKind::RNode, announce)).unwrap();
+
+        let meshcore = db.query_jraw_nodes(Some(1), 10).unwrap();
+        assert_eq!(meshcore.len(), 1);
+        assert_eq!(meshcore[0].name.as_deref(), Some("Node"));
+        assert_eq!(meshcore[0].frames, 2);
+        assert_eq!(meshcore[0].gateway_id, "!11223344");
+
+        let reticulum = db.query_jraw_nodes(Some(2), 10).unwrap();
+        assert_eq!(reticulum.len(), 1);
+        assert_eq!(reticulum[0].name.as_deref(), Some("Reticulum Node"));
+        assert_eq!(reticulum[0].node_hash, "abababababababababababababababab");
+    }
+
+    #[test]
     fn records_nexus_diagnostics() {
         let db = database();
         let diagnostics = NexusDiagnostics {
@@ -3633,7 +4176,7 @@ PRAGMA user_version = 1;
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 14);
         let packets: i64 = connection
             .query_row("SELECT COUNT(*) FROM packets", [], |row| row.get(0))
             .unwrap();

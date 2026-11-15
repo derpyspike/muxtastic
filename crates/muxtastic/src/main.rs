@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use muxtastic_core::channel_crypto::{self, ExtraChannel};
-use muxtastic_core::config::Config;
+use muxtastic_core::config::{Config, WebStorage};
 use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
@@ -455,7 +455,11 @@ fn open_web_database(config: &Config) -> Option<Arc<muxtastic_web::Database>> {
             "added all one-byte PSK extra channels"
         );
     }
-    match muxtastic_web::Database::open_with_channels(&config.web.database, extra_channels) {
+    let database_path = match config.web.storage {
+        WebStorage::Sqlite => config.web.database.as_str(),
+        WebStorage::Memory => ":memory:",
+    };
+    match muxtastic_web::Database::open_with_channels(database_path, extra_channels) {
         Ok((database, receiver)) => {
             tokio::spawn(muxtastic_web::run_writer(
                 Arc::downgrade(&database),
@@ -483,7 +487,10 @@ fn spawn_web(
         external_mqtt_connected,
         mock,
     } = web;
-    let database_path = config.database.clone();
+    let database_path = match config.storage {
+        WebStorage::Sqlite => config.database.clone(),
+        WebStorage::Memory => "memory (volatile)".to_owned(),
+    };
     let web_mqtt = config.mqtt.clone();
     let status: muxtastic_web::StatusFn = Arc::new(move || {
         let mut physical_connected = false;

@@ -12,12 +12,14 @@ enabled = true
 host = "127.0.0.1"          # loopback by default
 port = 8080
 database = "data/muxtastic.db"
+storage = "sqlite"          # "sqlite" or "memory"
 retention_days = 7          # 0 = keep packet history forever
 ```
 
 Legacy YAML uses the same `web:` section. The database directory is created on
-startup. `database = ":memory:"` is accepted but history is then lost when the
-daemon stops. Set `enabled = false` for a headless daemon.
+startup. Set `storage = "memory"` for a volatile SQLite database kept entirely
+in RAM; history is lost when the daemon stops. `database = ":memory:"` also
+works. Set `enabled = false` for a headless daemon.
 
 The UI has no authentication. It binds to loopback by default; if you expose it
 to a network, put it behind a reverse proxy with authentication or a firewall.
@@ -146,19 +148,26 @@ no local node, so the row is hidden.
   MQTT markers, the relay node and the Nexus-only `Δf` (Hz) and `CR`
   diagnostics when the firmware reports them. The relay node is displayed as
   its low byte (`0xNN`), matching the firmware's usual 1-byte relay field. When
-  a packet was heard by a gateway, an expandable “heard by N gateways” section
-  lists every receiver with its own SNR, RSSI, `Δf`, `CR`, relay node and hop
-  data. The channel dropdown filters the log. Packets decoded with an extra
-  channel key show a `decrypted` marker.
-- **Nodes** — known nodes with name, id, hardware, last-heard channel,
+  a packet was heard, an expandable reception list shows each repeat, including
+  the same gateway more than once, with its own SNR, RSSI, `Δf`, `CR`, relay
+  node and hop data. The channel dropdown filters the log and omits opaque/PKI
+  channels. Packets decoded with an extra channel key show a `decrypted` marker.
+- **Nodes** — a family switch for Meshtastic, MeshCore and Reticulum; MeshCore
+  and Reticulum lists come from stored JRAW adverts. Meshtastic nodes show name,
+  id, hardware, last-heard channel,
   `used_hops/hop_start`, battery, role, position and hearing gateways. Filter
   by role/source/hardware/channel, sort by any column (default last heard; hops
   sorts by used hops), and click a row for a detail dialog with all node facts
   and its packet table. The dialog has an **Open in new tab** link to the
-  standalone `/node/{num}` view.
-- **Packets** — protocol-oriented packet table with time, sender/recipient,
-  portnum, text contents, channel, hearing gateways, bytes, RF metrics, source
-  and decryption state. Filter by protocol, canonical channel, gateway, source
+  standalone `/node/{num}` view. Node details also show per-source RSSI, SNR
+  and frequency-error graphs across the recorded receptions.
+- **Packets** — family switch for Meshtastic packets, MeshCore JRAW and
+  Reticulum JRAW. The Meshtastic table is protocol-oriented with time,
+  sender/recipient, portnum, text contents, channel, hearing gateways, bytes,
+  RF metrics, source and decryption state. MeshCore/Reticulum tables show route,
+  payload, decoded text when present, path and path-hash size, node/sender
+  hashes and ADVERT node type (Companion, Repeater, Room Server, Sensor).
+  Filter the Meshtastic table by protocol, canonical channel, gateway, source
   and decrypted/not decrypted.
 - **Channels** — per-channel packet count, payload bytes, packets/h, bytes/h and
   percentage of all packets, with an expandable node breakdown ordered by
@@ -166,8 +175,9 @@ no local node, so the row is hidden.
 - **Raw feeds** — reassembled Nexus `JRAW` frames plus a Meshtastic packet feed.
   Type 1 (JenCore/MeshCore) shows route, payload type, path hashes,
   sender/destination hashes and ADVERT name/public key when present; type 2
-  (JenRNode/Reticulum) shows the raw payload; type 3 (Meshtastic) shows the
-  encoded `MeshPacket` and portnum. Each row has expandable hex, shows
+  (JenRNode/Reticulum) shows the raw payload plus parsed packet/context,
+  destination hash, public key and announce name when present; type 3
+  (Meshtastic) shows the encoded `MeshPacket` and portnum. Each row has expandable hex, shows
   `Δf`/`CR` when present, and marks frames decoded with an extra key.
 - **Receptions** — recent per-gateway packet observations with receiver,
   packet/from ids, relay node, source, SNR, RSSI, `Δf`, `CR`, hops, receive
@@ -183,8 +193,15 @@ no local node, so the row is hidden.
   `MQTT` source card instead of repeating each physical node; its expandable
   gateways list shows every local node uplinking through it plus every gateway
   seen in MQTT-sourced packets, with name, packet count and last-heard time.
-  Each physical source has expandable direct-node and connected-client lists;
-  clients show peer IP:port, connected/idle time and RX/TX bytes/frame counts.
+  Each physical source has expandable direct-node, connected-client and relay
+  stats lists. Clients show peer IP:port, connected/idle time and RX/TX
+  bytes/frame counts. Relay stats group receptions by relay byte with packet
+  counts, RSSI/SNR/Δf average/min/max/σ rows and per-metric range charts.
+  Expanding a relay shows its RSSI/SNR/Δf line timeline. Frequency-error charts
+  are zero-centred and use a robust scale so a single extreme offset does not
+  flatten the rest.
+  Each relay byte is shown with any matching zero-hop neighbour names (last
+  byte of the node number), or `unknown` when there is no match.
 
 Gateway ids are resolved to a node name whenever the node is known; the raw
 `!hex` id is only shown when the node has never been heard. This applies to the
@@ -209,17 +226,23 @@ status pills show physical link, MQTT state, connected clients and uptime.
 | `GET /static/app.js` | Dashboard script |
 | `GET /static/style.css` | Dashboard styles |
 | `GET /api/stats` | Live status, node cards, physical/MQTT sources, rates, percentages, channel/node breakdowns and channel list |
+| `GET /api/status` | Lightweight live status/source/client payload without database stats |
 | `GET /api/messages?channel=<name\|#index>&limit=200` | Text messages, newest first |
 | `GET /api/nodes` | Known nodes with hardware |
+| `GET /api/node-names` | Lightweight node id/name list for resolving labels |
 | `GET /api/nodes/{num}` | One node plus its recent packet rows |
 | `GET /node/{num}` | Standalone full-page node detail view |
 | `GET /api/raw?kind=1\|2\|3&limit=200` | Reassembled JRAW or Meshtastic raw frames |
 | `GET /api/channels` | Channels seen in packet history |
 | `GET /api/receptions?limit=200` | Recent per-gateway receptions |
+| `GET /api/receptions?from_num=N&limit=500` | Receptions for one node, grouped by source in the UI |
+| `GET /api/relay-stats?receiver=!hex&limit=100` | Relay-node packet counts and RSSI/SNR/Δf stats |
+| `GET /api/relay-series?receiver=!hex&limit=2000` | Reception samples for relay line timelines |
 | `GET /api/traceroutes?limit=200` | Recent direct/back traceroutes |
 | `GET /api/direct-nodes?receiver=!hex&limit=200` | Zero-hop nodes heard directly by one physical source |
 | `GET /api/packets?portnum=N&channel=<name\|#index>&gateway=!hex&source=physical&decrypted=true&limit=500` | Filtered packet list |
 | `GET /api/packet-filters` | Protocol and gateway options/counts for the Packets tab |
+| `GET /api/jraw-nodes?kind=1\|2&limit=500` | MeshCore or Reticulum nodes from JRAW adverts |
 | `GET /api/mqtt-gateways?limit=500` | Gateways seen in MQTT-sourced packets/raw frames |
 | `GET /api/receptions?from_num=N&packet_id=N` | Per-gateway receptions for one packet |
 
@@ -238,11 +261,12 @@ Tables:
 | Table | Contents |
 |---|---|
 | `packets` | One summary row per Meshtastic packet, deduplicated on `(from_num, packet_id)` when the id is non-zero (id, from/to, relay node, local channel index, resolved `channel_name`, `decrypted` flag, portnum, payload `bytes`, transport, via_mqtt, ingestion `source`, reception/gateway counts, best SNR/RSSI, RF/hops, Nexus `rx_frequency_error`/`rx_coding_rate`, received_at) |
-| `packet_receptions` | One row per receiver/gateway that heard a packet: local channel index, resolved `channel_name`, `decrypted` flag, receiver id, relay node, source, RSSI, SNR, hop data, Nexus `Δf`/`CR` when available, rx_time and received_at |
+| `packet_receptions` | One row per reception, including repeats from the same gateway: local channel index, resolved `channel_name`, `decrypted` flag, receiver id, relay node, source, RSSI, SNR, hop data, Nexus `Δf`/`CR` when available, rx_time and received_at |
 | `messages` | Text messages, deduplicated on `(from_num, packet_id)` when the id is non-zero; local channel index, resolved `channel_name`, ingestion source and Nexus diagnostics |
 | `nodes` | Latest known node identity, RF metrics, battery, position, public key and latest ingestion source |
 | `channels` | Global channel index/name fallback |
 | `node_channels` | Per-receiver channel index/name map (since schema v9) |
+| `jraw_nodes` | MeshCore/Reticulum advert nodes, public keys and frame counts (schema v12) |
 | `raw_frames` | Reassembled JRAW frames plus Meshtastic packet protobufs, kind/source, gateway, sequence, frame blob, MeshCore header fields, Nexus diagnostics and RF metrics |
 | `traceroutes` | Traceroute responses with direct `route`/`snr_towards` and back `route_back`/`snr_back` JSON arrays |
 

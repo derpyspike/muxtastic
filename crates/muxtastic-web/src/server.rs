@@ -16,8 +16,9 @@ use tokio::sync::watch;
 use tracing::info;
 
 use crate::db::{
-    Database, DirectNode, Message, MqttGateway, Node, PacketFilter, PacketFilterOptions,
-    PacketListEntry, PacketRow, RawFrame, Reception, Stats, Traceroute,
+    Database, DirectNode, JrawNode, Message, MqttGateway, Node, NodeName, PacketFilter,
+    PacketFilterOptions, PacketListEntry, PacketRow, RawFrame, Reception, RelaySample, RelayStats,
+    Stats, Traceroute,
 };
 
 /// One physical node in the multi-node status payload.
@@ -114,8 +115,10 @@ fn router(state: WebState) -> Router {
         .route("/static/style.css", get(style))
         .route("/static/app.js", get(script))
         .route("/api/stats", get(api_stats))
+        .route("/api/status", get(api_status))
         .route("/api/messages", get(api_messages))
         .route("/api/nodes", get(api_nodes))
+        .route("/api/node-names", get(api_node_names))
         .route("/api/nodes/{num}", get(api_node))
         .route("/node/{num}", get(node_page))
         .route("/api/raw", get(api_raw))
@@ -126,6 +129,9 @@ fn router(state: WebState) -> Router {
         .route("/api/mqtt-gateways", get(api_mqtt_gateways))
         .route("/api/packets", get(api_packets))
         .route("/api/packet-filters", get(api_packet_filters))
+        .route("/api/jraw-nodes", get(api_jraw_nodes))
+        .route("/api/relay-stats", get(api_relay_stats))
+        .route("/api/relay-series", get(api_relay_series))
         .with_state(state)
 }
 
@@ -170,6 +176,10 @@ async fn api_stats(State(state): State<WebState>) -> Result<Json<StatsResponse>,
     }))
 }
 
+async fn api_status(State(state): State<WebState>) -> Json<StatusSnapshot> {
+    Json((state.status)())
+}
+
 #[derive(Deserialize)]
 struct MessagesQuery {
     channel: Option<String>,
@@ -190,6 +200,11 @@ async fn api_messages(
 
 async fn api_nodes(State(state): State<WebState>) -> Result<Json<Vec<Node>>, ApiError> {
     let nodes = blocking(state.db.clone(), |db| db.query_nodes()).await?;
+    Ok(Json(nodes))
+}
+
+async fn api_node_names(State(state): State<WebState>) -> Result<Json<Vec<NodeName>>, ApiError> {
+    let nodes = blocking(state.db.clone(), |db| db.query_node_names()).await?;
     Ok(Json(nodes))
 }
 
@@ -303,6 +318,56 @@ async fn api_packet_filters(
 }
 
 #[derive(Deserialize)]
+struct JrawNodesQuery {
+    kind: Option<i64>,
+    limit: Option<usize>,
+}
+
+async fn api_jraw_nodes(
+    State(state): State<WebState>,
+    Query(query): Query<JrawNodesQuery>,
+) -> Result<Json<Vec<JrawNode>>, ApiError> {
+    let limit = query.limit.unwrap_or(500);
+    let nodes = blocking(state.db.clone(), move |db| {
+        db.query_jraw_nodes(query.kind, limit)
+    })
+    .await?;
+    Ok(Json(nodes))
+}
+
+#[derive(Deserialize)]
+struct RelayStatsQuery {
+    receiver: String,
+    limit: Option<usize>,
+}
+
+async fn api_relay_stats(
+    State(state): State<WebState>,
+    Query(query): Query<RelayStatsQuery>,
+) -> Result<Json<Vec<RelayStats>>, ApiError> {
+    let limit = query.limit.unwrap_or(100);
+    let receiver = query.receiver;
+    let stats = blocking(state.db.clone(), move |db| {
+        db.query_relay_stats(&receiver, limit)
+    })
+    .await?;
+    Ok(Json(stats))
+}
+
+async fn api_relay_series(
+    State(state): State<WebState>,
+    Query(query): Query<RelayStatsQuery>,
+) -> Result<Json<Vec<RelaySample>>, ApiError> {
+    let limit = query.limit.unwrap_or(2000);
+    let receiver = query.receiver;
+    let series = blocking(state.db.clone(), move |db| {
+        db.query_relay_series(&receiver, limit)
+    })
+    .await?;
+    Ok(Json(series))
+}
+
+#[derive(Deserialize)]
 struct TraceroutesQuery {
     limit: Option<usize>,
 }
@@ -327,6 +392,7 @@ async fn api_receptions(
     State(state): State<WebState>,
     Query(query): Query<ReceptionsQuery>,
 ) -> Result<Json<Vec<Reception>>, ApiError> {
+    let limit = query.limit.unwrap_or(200);
     let receptions = match (query.from_num, query.packet_id) {
         (Some(from_num), Some(packet_id)) => {
             blocking(state.db.clone(), move |db| {
@@ -334,8 +400,13 @@ async fn api_receptions(
             })
             .await?
         }
+        (Some(from_num), None) => {
+            blocking(state.db.clone(), move |db| {
+                db.query_node_receptions(from_num, limit)
+            })
+            .await?
+        }
         _ => {
-            let limit = query.limit.unwrap_or(200);
             blocking(state.db.clone(), move |db| {
                 db.query_recent_receptions(limit)
             })
