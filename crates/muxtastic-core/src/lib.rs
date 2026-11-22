@@ -7,6 +7,7 @@
 pub mod channel_crypto;
 pub mod config;
 pub mod details;
+pub mod meshcore;
 pub mod mqtt;
 pub mod nexus;
 pub mod packet;

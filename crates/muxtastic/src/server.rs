@@ -2,27 +2,25 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use tokio::net::TcpListener;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::app::AppState;
 use crate::client;
 
-pub async fn run(state: Arc<AppState>) {
+/// Accept clients until shutdown. Returns an error when the port cannot be
+/// bound, which the caller turns into a non-zero exit.
+pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
     let server = state.config.server.clone();
-    let listener = match TcpListener::bind((server.host.as_str(), server.port)).await {
-        Ok(listener) => listener,
-        Err(error) => {
-            error!(
-                host = %server.host,
-                port = server.port,
-                %error,
-                "failed to bind the multiplexer port"
-            );
-            let _ = state.shutdown.send(true);
-            return;
-        }
-    };
+    let listener = TcpListener::bind((server.host.as_str(), server.port))
+        .await
+        .with_context(|| {
+            format!(
+                "failed to bind the multiplexer port {}:{}",
+                server.host, server.port
+            )
+        })?;
 
     if let Ok(address) = listener.local_addr() {
         info!(%address, "TCP server listening");
@@ -64,4 +62,5 @@ pub async fn run(state: Arc<AppState>) {
     }
 
     info!("TCP server stopped");
+    Ok(())
 }

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use meshtastic::protobufs as pb;
 use muxtastic_core::config::Config;
@@ -12,11 +12,15 @@ use muxtastic_core::raw_tunnel::{AssemblerResult, RawTunnelAssembler, RawTunnelF
 use muxtastic_core::router::Cidr;
 use muxtastic_core::state::StateCache;
 use muxtastic_web::Database;
-use tokio::io::AsyncWrite;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc, watch, Mutex};
 use tracing::{debug, warn};
 
 pub type PhysicalWriter = Box<dyn AsyncWrite + Unpin + Send>;
+
+/// Upper bound for one framed write to the physical node. A link that cannot
+/// take a ~516-byte frame in this time is treated as dead.
+pub const PHYSICAL_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One frame queued for connected clients.
 ///
@@ -71,6 +75,10 @@ pub struct AppState {
     pub next_client_id: AtomicU64,
     clients: StdMutex<HashMap<u64, ClientRecord>>,
     pub connected: AtomicBool,
+    /// True when the physical node is simulated (`--mock`).
+    pub mock: bool,
+    /// Set once the physical node has finished its first config dump.
+    pub synced: AtomicBool,
     pub shutdown: watch::Sender<bool>,
     mqtt_bridge: OnceLock<Weak<crate::mqtt::MqttBridge>>,
     raw_tunnel: StdMutex<RawTunnelAssembler>,
@@ -82,6 +90,7 @@ impl AppState {
     pub fn new(
         config: Config,
         shutdown: watch::Sender<bool>,
+        mock: bool,
     ) -> (Arc<Self>, mpsc::Receiver<Vec<u8>>, mpsc::Receiver<()>) {
         let allow_admin_from = config
             .security
@@ -128,6 +137,8 @@ impl AppState {
             next_client_id: AtomicU64::new(1),
             clients: StdMutex::new(HashMap::new()),
             connected: AtomicBool::new(false),
+            mock,
+            synced: AtomicBool::new(false),
             shutdown,
             mqtt_bridge: OnceLock::new(),
             raw_tunnel: StdMutex::new(RawTunnelAssembler::new()),
@@ -282,6 +293,38 @@ impl AppState {
             .my_node_num
     }
 
+    /// Write already-framed bytes to the physical node.
+    ///
+    /// The writer lock is never held longer than [`PHYSICAL_WRITE_TIMEOUT`]. A
+    /// failed or timed-out write drops the writer and clears `connected`, which
+    /// makes the read loop exit so the supervisor reconnects.
+    pub async fn write_physical(&self, bytes: &[u8]) -> std::io::Result<()> {
+        let mut slot = self.writer.lock().await;
+        let Some(writer) = slot.as_mut() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "physical node is not connected",
+            ));
+        };
+
+        let write = async {
+            writer.write_all(bytes).await?;
+            writer.flush().await
+        };
+        let result = match tokio::time::timeout(PHYSICAL_WRITE_TIMEOUT, write).await {
+            Ok(result) => result,
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "write to the physical node timed out",
+            )),
+        };
+        if result.is_err() {
+            *slot = None;
+            self.connected.store(false, Ordering::SeqCst);
+        }
+        result
+    }
+
     /// Queue one unframed `ToRadio` message for the physical node.
     pub fn queue_to_node(&self, payload: Vec<u8>) -> bool {
         match self.to_node.try_send(payload) {
@@ -331,30 +374,21 @@ pub async fn dispatcher(state: Arc<AppState>, mut rx: mpsc::Receiver<Vec<u8>>) {
                     continue;
                 };
 
-                let mut slot = state.writer.lock().await;
-                let Some(writer) = slot.as_mut() else {
-                    debug!("physical node not connected; dropping client payload");
-                    continue;
-                };
-
-                use tokio::io::AsyncWriteExt;
-                if let Err(error) = writer.write_all(&frame).await {
-                    warn!(%error, "write to physical node failed");
-                    *slot = None;
-                    state.connected.store(false, Ordering::SeqCst);
-                    continue;
+                match state.write_physical(&frame).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotConnected => {
+                        debug!("physical node not connected; dropping client payload");
+                        continue;
+                    }
+                    Err(error) => {
+                        warn!(%error, "write to physical node failed; dropping the link");
+                        continue;
+                    }
                 }
-                if let Err(error) = writer.flush().await {
-                    warn!(%error, "flush to physical node failed");
-                    *slot = None;
-                    state.connected.store(false, Ordering::SeqCst);
-                    continue;
-                }
-                drop(slot);
 
                 // 10 ms between sends keeps a burst of clients from flooding
                 // the firmware's single API session.
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }
     }
@@ -374,7 +408,7 @@ pub async fn resync_worker(state: Arc<AppState>, mut rx: mpsc::Receiver<()>) {
                 if request.is_none() {
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                tokio::time::sleep(Duration::from_secs(3)).await;
                 while rx.try_recv().is_ok() {}
                 crate::physical::send_want_config(&state).await;
             }

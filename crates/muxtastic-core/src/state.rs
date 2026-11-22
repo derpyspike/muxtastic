@@ -9,6 +9,11 @@ use std::collections::BTreeMap;
 use meshtastic::protobufs::{self as pb, config, from_radio, module_config};
 use meshtastic::Message;
 
+/// Upper bound for [`StateCache::known_nodes`]. Firmware node databases hold
+/// a few hundred entries; the cap only matters when NodeInfo keeps arriving
+/// for new senders (busy meshes, MQTT downlink) for a long time.
+pub const MAX_KNOWN_NODES: usize = 2000;
+
 #[derive(Debug, Default, Clone)]
 pub struct StateCache {
     pub my_node_num: u32,
@@ -85,6 +90,26 @@ impl StateCache {
             self.node_info = Some(node.clone());
         }
         self.known_nodes.insert(num, node);
+        self.evict_stale_nodes(num);
+    }
+
+    /// Keep the node database within [`MAX_KNOWN_NODES`] by dropping the
+    /// least recently heard nodes. The local node and the node that was just
+    /// stored (`keep`) are never dropped.
+    fn evict_stale_nodes(&mut self, keep: u32) {
+        while self.known_nodes.len() > MAX_KNOWN_NODES {
+            let my_node_num = self.my_node_num;
+            let Some(stale) = self
+                .known_nodes
+                .iter()
+                .filter(|(num, _)| **num != my_node_num && **num != keep)
+                .min_by_key(|(_, node)| node.last_heard)
+                .map(|(num, _)| *num)
+            else {
+                return;
+            };
+            self.known_nodes.remove(&stale);
+        }
     }
 
     fn apply_packet(&mut self, pkt: &pb::MeshPacket) {
@@ -241,6 +266,47 @@ mod tests {
 
         assert!(cache.node_info.is_some());
         assert!(cache.known_nodes.contains_key(&7));
+    }
+
+    #[test]
+    fn known_nodes_are_capped_and_evict_the_least_recently_heard() {
+        let mut cache = StateCache::new();
+        cache.my_node_num = 1;
+        let add = |cache: &mut StateCache, num: u32, last_heard: u32| {
+            cache.apply_message(
+                &pb::FromRadio {
+                    id: 0,
+                    payload_variant: Some(from_radio::PayloadVariant::NodeInfo(pb::NodeInfo {
+                        num,
+                        last_heard,
+                        ..Default::default()
+                    })),
+                },
+                &[],
+            );
+        };
+
+        // The local node is the stalest entry of all and must survive.
+        add(&mut cache, 1, 0);
+        for num in 2..=MAX_KNOWN_NODES as u32 {
+            add(&mut cache, num, 1_000 + num);
+        }
+        assert_eq!(cache.known_nodes.len(), MAX_KNOWN_NODES);
+
+        // One more: node 2 (oldest last_heard besides the local node) goes.
+        add(&mut cache, 900_000, 5_000_000);
+        assert_eq!(cache.known_nodes.len(), MAX_KNOWN_NODES);
+        assert!(cache.known_nodes.contains_key(&1));
+        assert!(!cache.known_nodes.contains_key(&2));
+        assert!(cache.known_nodes.contains_key(&3));
+        assert!(cache.known_nodes.contains_key(&900_000));
+
+        // A new node with no timestamp is kept; the next stalest one goes.
+        add(&mut cache, 900_001, 0);
+        assert_eq!(cache.known_nodes.len(), MAX_KNOWN_NODES);
+        assert!(cache.known_nodes.contains_key(&900_001));
+        assert!(!cache.known_nodes.contains_key(&3));
+        assert!(cache.node_info.is_some());
     }
 
     #[test]

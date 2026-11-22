@@ -41,9 +41,16 @@ pub fn position(packet: &pb::MeshPacket) -> Option<pb::Position> {
     (latitude != 0 || longitude != 0).then_some(position)
 }
 
-/// Hops away from the local node using the firmware's 3-hop start value.
+/// Hops the packet travelled before it reached the local node.
+///
+/// Uses the sender's `hop_start` when the packet carries a usable one. Older
+/// firmware leaves it at zero; then the default 3-hop start is assumed.
 pub fn hops_away(packet: &pb::MeshPacket) -> u32 {
-    3u32.saturating_sub(packet.hop_limit)
+    if packet.hop_start != 0 && packet.hop_start >= packet.hop_limit {
+        packet.hop_start - packet.hop_limit
+    } else {
+        3u32.saturating_sub(packet.hop_limit)
+    }
 }
 
 #[cfg(test)]
@@ -73,6 +80,24 @@ mod tests {
         assert_eq!(nodeinfo(&packet).unwrap().long_name, "Alice");
         assert_eq!(hops_away(&packet), 1);
         assert_eq!(portnum(&packet), Some(pb::PortNum::NodeinfoApp as i32));
+    }
+
+    #[test]
+    fn hops_use_hop_start_when_present() {
+        let hops = |hop_start, hop_limit| {
+            hops_away(&pb::MeshPacket {
+                hop_start,
+                hop_limit,
+                ..Default::default()
+            })
+        };
+        assert_eq!(hops(7, 5), 2);
+        assert_eq!(hops(5, 5), 0);
+        assert_eq!(hops(2, 2), 0);
+        // No hop_start, or a nonsensical one: assume the 3-hop default.
+        assert_eq!(hops(0, 2), 1);
+        assert_eq!(hops(0, 7), 0);
+        assert_eq!(hops(2, 3), 0);
     }
 
     #[test]

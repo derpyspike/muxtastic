@@ -4,8 +4,9 @@
 //! monotonic time in milliseconds so the dedupe windows can be unit-tested.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::net::Ipv6Addr;
 
 use meshtastic::protobufs as pb;
 use meshtastic::Message;
@@ -64,26 +65,50 @@ pub fn client_id(version: &str, mqtt_username: &str, node_num: u32, uuid12: &str
     sanitize_client_id(&raw)
 }
 
-/// Bare lowercase host used for broker comparisons.
+/// Bare lowercase host used for broker comparisons and for connecting.
+///
+/// Strips a URL scheme, a path and a `:port` suffix. IPv6 literals are
+/// returned without brackets: `[fd7a::1]:1883` and `fd7a::1` both give
+/// `fd7a::1`. Only a genuinely empty input falls back to the public default
+/// broker; anything that cannot be understood is returned as-is so the
+/// connection fails visibly instead of silently going to the wrong host.
 pub fn normalize_broker_host(address: &str) -> String {
-    let mut host = address.trim().to_ascii_lowercase();
+    let lowered = address.trim().to_ascii_lowercase();
+    let mut rest = lowered.as_str();
     for prefix in ["mqtt://", "mqtts://", "tcp://", "ssl://"] {
-        if let Some(rest) = host.strip_prefix(prefix) {
-            host = rest.to_owned();
+        if let Some(stripped) = rest.strip_prefix(prefix) {
+            rest = stripped;
             break;
         }
     }
-    let host = host
-        .split('/')
-        .next()
-        .unwrap_or_default()
-        .split(':')
-        .next()
-        .unwrap_or_default();
-    if host.is_empty() {
-        DEFAULT_BROKER.to_owned()
-    } else {
-        host.to_owned()
+    let authority = rest.split('/').next().unwrap_or_default();
+    if authority.is_empty() {
+        return if rest.is_empty() {
+            DEFAULT_BROKER.to_owned()
+        } else {
+            rest.to_owned()
+        };
+    }
+
+    // `[v6]` or `[v6]:port`.
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        return match bracketed.split_once(']') {
+            Some((host, _port)) if !host.is_empty() => host.to_owned(),
+            _ => authority.to_owned(),
+        };
+    }
+
+    // A bare IPv6 literal has several colons and no port.
+    if authority.parse::<Ipv6Addr>().is_ok() {
+        return authority.to_owned();
+    }
+
+    match authority.split_once(':') {
+        None => authority.to_owned(),
+        // `host:port`. More colons that are not an IPv6 address, or an empty
+        // host, are not something we can interpret.
+        Some((host, port)) if !host.is_empty() && !port.contains(':') => host.to_owned(),
+        Some(_) => authority.to_owned(),
     }
 }
 
@@ -112,7 +137,10 @@ pub fn broker2_active(primary: &MqttBridgeConfig, secondary: Option<&SecondaryMq
 /// Ensure a proxy topic lives under the configured root.
 pub fn topic_for_proxy(root: &str, topic: &str) -> String {
     let root = root.trim_end_matches('/');
-    if topic.starts_with(root) {
+    let under_root = topic
+        .strip_prefix(root)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'));
+    if under_root {
         topic.to_owned()
     } else {
         format!("{root}/{}", topic.trim_start_matches('/'))
@@ -282,22 +310,31 @@ pub fn is_own_envelope(payload: &[u8], node_num: u32) -> bool {
 }
 
 /// Fixed-window keyed set shared by the packet-id and echo caches.
+///
+/// `capacity` is a hard cap: when the set is full the oldest entry is evicted,
+/// even if it has not expired yet. `order` remembers insertion order so both
+/// expiry and eviction pop from the front instead of scanning the map.
+/// Timestamps are expected to be monotonic (the daemon passes elapsed time).
 #[derive(Debug, Clone)]
 struct RecentWindow<K> {
     window_ms: u64,
     capacity: usize,
     entries: HashMap<K, u64>,
+    /// `(key, timestamp)` in insertion order. An element is stale when the map
+    /// holds a newer timestamp for its key (the key was noted again).
+    order: VecDeque<(K, u64)>,
 }
 
 impl<K> RecentWindow<K>
 where
-    K: Eq + std::hash::Hash,
+    K: Eq + std::hash::Hash + Clone,
 {
     fn new(window_ms: u64, capacity: usize) -> Self {
         Self {
             window_ms,
-            capacity,
+            capacity: capacity.max(1),
             entries: HashMap::new(),
+            order: VecDeque::new(),
         }
     }
 
@@ -313,16 +350,46 @@ where
     }
 
     fn note(&mut self, key: K, now_ms: u64) {
-        self.entries.insert(key, now_ms);
-        if self.entries.len() > self.capacity {
-            self.prune(now_ms);
+        self.drop_expired(now_ms);
+        self.entries.insert(key.clone(), now_ms);
+        self.order.push_back((key, now_ms));
+        while self.entries.len() > self.capacity {
+            if !self.pop_oldest() {
+                break;
+            }
+        }
+        // Re-noting the same keys leaves stale elements behind; compact
+        // before they can outgrow the cap. Amortised O(1) per insert.
+        if self.order.len() > self.capacity.saturating_mul(2) {
+            let entries = &self.entries;
+            self.order
+                .retain(|(key, timestamp)| entries.get(key) == Some(timestamp));
         }
     }
 
-    fn prune(&mut self, now_ms: u64) {
-        let window = self.window_ms;
-        self.entries
-            .retain(|_, timestamp| now_ms.saturating_sub(*timestamp) <= window);
+    /// Pop the front element and remove its key unless a newer note exists.
+    fn pop_oldest(&mut self) -> bool {
+        let Some((key, timestamp)) = self.order.pop_front() else {
+            return false;
+        };
+        if self.entries.get(&key) == Some(&timestamp) {
+            self.entries.remove(&key);
+        }
+        true
+    }
+
+    fn drop_expired(&mut self, now_ms: u64) {
+        while let Some((_, timestamp)) = self.order.front() {
+            if now_ms.saturating_sub(*timestamp) <= self.window_ms {
+                break;
+            }
+            self.pop_oldest();
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
     }
 }
 
@@ -347,7 +414,8 @@ impl RecentIds {
         self.inner.note(id, now_ms);
     }
 
-    /// Returns true when the id was already present and not stale.
+    /// Records the id and returns true when it is new (absent or stale);
+    /// returns false, without refreshing it, when it was seen within the window.
     pub fn note_if_new(&mut self, id: u32, now_ms: u64) -> bool {
         if self.contains(id, now_ms) {
             return false;
@@ -357,10 +425,10 @@ impl RecentIds {
     }
 }
 
-/// Fixed-window echo suppression keyed by topic plus payload hash.
+/// Fixed-window echo suppression keyed by a hash of topic plus payload.
 #[derive(Debug, Clone)]
 pub struct RecentPublishes {
-    inner: RecentWindow<(String, u64)>,
+    inner: RecentWindow<u64>,
 }
 
 impl RecentPublishes {
@@ -371,18 +439,18 @@ impl RecentPublishes {
     }
 
     pub fn is_recent(&mut self, topic: &str, payload: &[u8], now_ms: u64) -> bool {
-        let key = (topic.to_owned(), payload_hash(payload));
-        self.inner.contains(&key, now_ms)
+        self.inner.contains(&publish_key(topic, payload), now_ms)
     }
 
     pub fn remember(&mut self, topic: &str, payload: &[u8], now_ms: u64) {
-        let key = (topic.to_owned(), payload_hash(payload));
-        self.inner.note(key, now_ms);
+        self.inner.note(publish_key(topic, payload), now_ms);
     }
 }
 
-fn payload_hash(payload: &[u8]) -> u64 {
+/// One 64-bit key for a publish; avoids copying the topic for every lookup.
+fn publish_key(topic: &str, payload: &[u8]) -> u64 {
     let mut hasher = DefaultHasher::new();
+    topic.hash(&mut hasher);
     payload.hash(&mut hasher);
     hasher.finish()
 }
@@ -429,6 +497,26 @@ mod tests {
             "example.com"
         );
         assert_eq!(normalize_broker_host(""), DEFAULT_BROKER);
+        assert_eq!(normalize_broker_host("  "), DEFAULT_BROKER);
+        assert_eq!(normalize_broker_host("mqtt://"), DEFAULT_BROKER);
+        assert_eq!(normalize_broker_host("broker.local:1883"), "broker.local");
+        assert_eq!(normalize_broker_host("192.168.1.6:1883"), "192.168.1.6");
+
+        // IPv6 literals keep every group and lose only brackets and port.
+        assert_eq!(normalize_broker_host("::1"), "::1");
+        assert_eq!(normalize_broker_host("[fd7a::1]"), "fd7a::1");
+        assert_eq!(normalize_broker_host("[FD7A::1]:1883"), "fd7a::1");
+        assert_eq!(normalize_broker_host("2001:db8::1"), "2001:db8::1");
+        assert_eq!(
+            normalize_broker_host("mqtts://[2001:db8::1]:8883/x"),
+            "2001:db8::1"
+        );
+
+        // Unparseable input is never replaced by the public broker.
+        for odd in [":1883", "[fd7a::1", "[]", "a:b:c", "mqtt:///path"] {
+            assert_ne!(normalize_broker_host(odd), DEFAULT_BROKER, "{odd}");
+        }
+        assert_eq!(normalize_broker_host("a:b:c"), "a:b:c");
 
         let p = primary();
         assert!(!brokers_overlap(&p, None));
@@ -440,12 +528,22 @@ mod tests {
             &p,
             Some(&secondary("other.example", 8883))
         ));
+
+        // Two different IPv6 brokers no longer collapse into one host.
+        let mut v6 = primary();
+        v6.broker = "[fd7a::1]".into();
+        assert!(!brokers_overlap(&v6, Some(&secondary("[fd7a::2]", 8883))));
+        assert!(brokers_overlap(&v6, Some(&secondary("fd7a::1", 8883))));
     }
 
     #[test]
     fn topics_region_and_roots() {
         assert_eq!(topic_for_proxy("msh", "/2/e/foo"), "msh/2/e/foo");
         assert_eq!(topic_for_proxy("msh/", "msh/2/e/foo"), "msh/2/e/foo");
+        assert_eq!(topic_for_proxy("msh", "msh"), "msh");
+        // A shared prefix is not the root: these stay confined under it.
+        assert_eq!(topic_for_proxy("msh", "mshx/2/e/foo"), "msh/mshx/2/e/foo");
+        assert_eq!(topic_for_proxy("msh", "msh2"), "msh/msh2");
         assert!(is_valid_downlink_topic("msh", "raw", "msh/2/e/x"));
         assert!(is_valid_downlink_topic("msh", "raw", "raw/EU_868/x"));
         assert!(!is_valid_downlink_topic("msh", "raw", "other/x"));
@@ -567,6 +665,54 @@ mod tests {
         assert!(ids.contains(1, 60_000));
         assert!(!ids.contains(1, 60_001));
         assert!(ids.note_if_new(1, 60_001));
+    }
+
+    #[test]
+    fn recent_window_capacity_is_a_hard_cap() {
+        // Nothing expires (huge window), so only the cap can bound the set.
+        let mut ids = RecentIds::new(u64::MAX, 3);
+        for id in 1..=10 {
+            ids.note(id, u64::from(id));
+            assert!(ids.inner.len() <= 3);
+        }
+        // The three newest survive, the oldest were evicted.
+        assert!(!ids.contains(7, 11));
+        assert!(ids.contains(8, 11));
+        assert!(ids.contains(10, 11));
+
+        // Re-noting a key refreshes it: it is no longer the oldest.
+        ids.note(8, 12);
+        ids.note(11, 13);
+        ids.note(12, 14);
+        assert!(ids.contains(8, 15));
+        assert!(!ids.contains(9, 15));
+        assert!(!ids.contains(10, 15));
+
+        // Hammering one key does not let the bookkeeping grow.
+        for now in 20..10_000 {
+            ids.note(8, now);
+        }
+        assert!(ids.inner.order.len() <= 6);
+        assert!(ids.inner.len() <= 3);
+
+        let mut publishes = RecentPublishes::new(u64::MAX, 4);
+        for index in 0..100u64 {
+            publishes.remember("msh/x", &index.to_le_bytes(), index);
+        }
+        assert_eq!(publishes.inner.len(), 4);
+        assert!(publishes.is_recent("msh/x", &99u64.to_le_bytes(), 100));
+        assert!(!publishes.is_recent("msh/x", &0u64.to_le_bytes(), 100));
+    }
+
+    #[test]
+    fn recent_window_drops_expired_entries_on_insert() {
+        let mut ids = RecentIds::new(1_000, 100);
+        for id in 0..50 {
+            ids.note(id, 0);
+        }
+        ids.note(99, 5_000);
+        assert_eq!(ids.inner.len(), 1);
+        assert!(ids.contains(99, 5_500));
     }
 
     #[test]

@@ -23,20 +23,38 @@
     </div>
   </header>
 
-  <nav class="tabs" id="tabs">
-    <button data-tab="stats" class="active">Mesh Stats</button>
-    <button data-tab="chat">Chat</button>
-    <button data-tab="nodes">Nodes</button>
-    <button data-tab="packets">Packets</button>
-    <button data-tab="channels">Channels</button>
-    <button data-tab="raw">Raw feeds</button>
-    <button data-tab="receptions">Receptions</button>
-    <button data-tab="traces">Traces</button>
-    <button data-tab="sources">Sources</button>
+  <nav class="tabs" id="tabs" role="tablist" aria-label="Dashboard sections">
+    <button data-tab="stats" class="active" aria-selected="true" role="tab" aria-controls="tab-stats">Mesh Stats</button>
+    <button data-tab="chat" aria-selected="false" role="tab" aria-controls="tab-chat">Chat</button>
+    <button data-tab="nodes" aria-selected="false" role="tab" aria-controls="tab-nodes">Nodes</button>
+    <button data-tab="map" aria-selected="false" role="tab" aria-controls="tab-map">Map</button>
+    <button data-tab="packets" aria-selected="false" role="tab" aria-controls="tab-packets">Packets</button>
+    <button data-tab="channels" aria-selected="false" role="tab" aria-controls="tab-channels">Channels</button>
+    <button data-tab="raw" aria-selected="false" role="tab" aria-controls="tab-raw">Raw feeds</button>
+    <button data-tab="receptions" aria-selected="false" role="tab" aria-controls="tab-receptions">Receptions</button>
+    <button data-tab="traces" aria-selected="false" role="tab" aria-controls="tab-traces">Traces</button>
+    <button data-tab="sources" aria-selected="false" role="tab" aria-controls="tab-sources">Sources</button>
   </nav>
 
   <main>
     <section id="tab-stats" class="panel active">
+      <div class="subtabs" id="stats-family" role="tablist" aria-label="Network">
+        <button type="button" data-family="mt" class="active" role="tab" aria-selected="true">Meshtastic</button>
+        <button type="button" data-family="mc" role="tab" aria-selected="false">MeshCore</button>
+        <button type="button" data-family="rnode" role="tab" aria-selected="false">Reticulum</button>
+      </div>
+      <div id="stats-jraw" hidden>
+        <div class="cards" id="jraw-stat-cards"></div>
+        <section class="block">
+          <div class="block-head">
+            <h2>Frames, last 24 hours</h2>
+            <span id="jraw-hourly-total" class="muted"></span>
+          </div>
+          <div id="jraw-hourly" class="chart"></div>
+        </section>
+        <div class="grid2" id="jraw-stat-tables"></div>
+      </div>
+      <div id="stats-mt">
       <div class="cards" id="stat-cards"></div>
 
       <div class="grid2">
@@ -88,6 +106,7 @@
             <tbody id="top-nodes"></tbody></table>
         </section>
       </div>
+      </div>
     </section>
 
     <section id="tab-chat" class="panel">
@@ -135,14 +154,31 @@
       <div class="table-wrap" id="nodes-jraw-table" hidden>
         <table class="wide">
           <thead><tr>
-            <th>Node</th><th>Hash</th><th>Type</th><th>Gateway</th>
-            <th class="num">Frames</th><th>First heard</th><th>Last heard</th><th>Public key</th>
+            <th data-jsort="name">Node</th><th data-jsort="hash">Hash</th><th data-jsort="type">Type</th><th data-jsort="gateway">Gateway</th>
+            <th data-jsort="frames" class="num">Frames</th><th data-jsort="first_heard">First heard</th><th data-jsort="last_heard">Last heard</th><th data-jsort="position">Position</th><th data-jsort="key">Public key</th>
           </tr></thead>
           <tbody id="nodes-jraw-body"></tbody>
         </table>
       </div>
     </section>
 
+    <section id="tab-map" class="panel">
+      <div class="toolbar">
+        <label class="toggle"><input type="checkbox" id="map-meshtastic" checked> <span class="map-dot meshtastic"></span>Meshtastic</label>
+        <label class="toggle"><input type="checkbox" id="map-meshcore" checked> MeshCore: <span class="map-dot repeater"></span>repeaters <span class="map-dot room"></span>rooms <span class="map-dot meshcore"></span>others</label>
+        <select id="map-max-age" aria-label="Last heard">
+          <option value="">Heard at any time</option>
+          <option value="3600">Heard in the last hour</option>
+          <option value="86400">Heard in the last 24 hours</option>
+          <option value="604800">Heard in the last 7 days</option>
+        </select>
+        <button id="map-fit" class="button" type="button">Fit to nodes</button>
+        <span class="muted" id="map-count"></span>
+        <span class="bad-value" id="map-invalid" hidden></span>
+        <span class="muted" id="map-note"></span>
+      </div>
+      <div id="map" class="map"></div>
+    </section>
 
     <section id="tab-packets" class="panel">
       <div class="toolbar">
@@ -165,6 +201,16 @@
           <option value="true">Decrypted</option>
           <option value="false">Not decrypted</option>
         </select>
+        <select id="jraw-payload" hidden aria-label="Payload type"><option value="">All payload types</option></select>
+        <select id="jraw-channel" hidden aria-label="Channel"><option value="">All channels</option></select>
+        <select id="jraw-decrypted" hidden aria-label="Decryption">
+          <option value="">Any decryption</option>
+          <option value="true">Decrypted</option>
+          <option value="false">Group, not decrypted</option>
+        </select>
+        <select id="jraw-region" hidden aria-label="Region"><option value="">Any region or none</option></select>
+        <select id="jraw-route" hidden aria-label="Route"><option value="">All routes</option></select>
+        <input id="jraw-search" type="search" hidden placeholder="Search text, names, hashes…">
         <button id="packet-refresh" class="button">Refresh</button>
         <span class="muted" id="packet-count"></span>
       </div>
@@ -242,7 +288,10 @@
 
   <footer>
     <span id="db-note"></span>
-    <span id="last-refresh"></span>
+    <span class="refresh-note">
+      <span id="refresh-paused" class="paused-note" role="status" hidden>list paused while a panel is open ·</span>
+      <span id="last-refresh"></span>
+    </span>
   </footer>
 
   <script src="/static/app.js"></script>

@@ -97,7 +97,49 @@ async fn send_frame(socket: &mut TcpStream, frame: &pb::FromRadio) -> std::io::R
     socket.write_all(&encoded).await
 }
 
-async fn fake_physical_node(socket: &mut TcpStream) -> Outcome {
+/// How the fake node answers `get_module_config_request`.
+#[derive(Clone, Copy)]
+enum ReplyForm {
+    /// Bare `FromRadio.moduleConfig`, as in a config dump.
+    ModuleConfigFrame,
+    /// `ADMIN_APP` packet with `get_module_config_response`, as real firmware.
+    AdminPacket,
+}
+
+fn module_config_reply(form: ReplyForm, mqtt: &module_config::MqttConfig) -> pb::FromRadio {
+    let module = pb::ModuleConfig {
+        payload_variant: Some(module_config::PayloadVariant::Mqtt(mqtt.clone())),
+    };
+    match form {
+        ReplyForm::ModuleConfigFrame => pb::FromRadio {
+            id: 4,
+            payload_variant: Some(from_radio::PayloadVariant::ModuleConfig(module)),
+        },
+        ReplyForm::AdminPacket => {
+            let admin = pb::AdminMessage {
+                payload_variant: Some(admin_message::PayloadVariant::GetModuleConfigResponse(
+                    module,
+                )),
+                ..Default::default()
+            };
+            pb::FromRadio {
+                id: 4,
+                payload_variant: Some(from_radio::PayloadVariant::Packet(pb::MeshPacket {
+                    from: NODE_NUM,
+                    to: NODE_NUM,
+                    payload_variant: Some(pb::mesh_packet::PayloadVariant::Decoded(pb::Data {
+                        portnum: pb::PortNum::AdminApp as i32,
+                        payload: admin.encode_to_vec(),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                })),
+            }
+        }
+    }
+}
+
+async fn fake_physical_node(socket: &mut TcpStream, form: ReplyForm) -> Outcome {
     let mut mqtt = module_config::MqttConfig {
         enabled: false,
         proxy_to_client_enabled: false,
@@ -173,16 +215,7 @@ async fn fake_physical_node(socket: &mut TcpStream) -> Outcome {
 
                     match admin.payload_variant {
                         Some(admin_message::PayloadVariant::GetModuleConfigRequest(_)) => {
-                            let response = pb::FromRadio {
-                                id: 4,
-                                payload_variant: Some(from_radio::PayloadVariant::ModuleConfig(
-                                    pb::ModuleConfig {
-                                        payload_variant: Some(module_config::PayloadVariant::Mqtt(
-                                            mqtt.clone(),
-                                        )),
-                                    },
-                                )),
-                            };
+                            let response = module_config_reply(form, &mqtt);
                             send_frame(socket, &response)
                                 .await
                                 .expect("send module config");
@@ -232,8 +265,7 @@ async fn fake_physical_node(socket: &mut TcpStream) -> Outcome {
     }
 }
 
-#[tokio::test]
-async fn provisions_mqtt_flags_on_the_physical_node() {
+async fn provisions_with(form: ReplyForm) {
     let physical = TokioListener::bind(("127.0.0.1", 0))
         .await
         .expect("bind the fake physical node");
@@ -255,9 +287,12 @@ async fn provisions_mqtt_flags_on_the_physical_node() {
         .expect("the daemon did not connect to the fake node")
         .expect("accept the daemon connection");
 
-    let outcome = tokio::time::timeout(Duration::from_secs(15), fake_physical_node(&mut socket))
-        .await
-        .expect("provisioning timed out");
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(15),
+        fake_physical_node(&mut socket, form),
+    )
+    .await
+    .expect("provisioning timed out");
 
     let _ = std::fs::remove_file(path);
 
@@ -268,4 +303,14 @@ async fn provisions_mqtt_flags_on_the_physical_node() {
     assert!(outcome.mqtt.enabled);
     assert!(outcome.mqtt.proxy_to_client_enabled);
     assert_eq!(outcome.mqtt.address, "fake-broker");
+}
+
+#[tokio::test]
+async fn provisions_mqtt_flags_on_the_physical_node() {
+    provisions_with(ReplyForm::ModuleConfigFrame).await;
+}
+
+#[tokio::test]
+async fn provisions_when_the_node_answers_with_an_admin_packet() {
+    provisions_with(ReplyForm::AdminPacket).await;
 }

@@ -39,11 +39,18 @@ pub async fn start(state: &Arc<AppState>, timeout: Duration) -> Option<MdnsHandl
         return None;
     }
 
+    let Some(address) = advertised_address(&state.config.server.host) else {
+        info!(
+            host = %state.config.server.host,
+            "mDNS discovery skipped: the server only listens on loopback"
+        );
+        return None;
+    };
+
     let node_num = wait_for_node_id(state, timeout).await;
     let slug = node_slug(node_num);
     let instance = format!("Multiplextashtic-{slug}");
     let host = format!("{instance}.local.");
-    let address = IpAddr::V4(local_ipv4());
 
     let short_name = state
         .cache
@@ -130,6 +137,19 @@ fn node_slug(node_num: u32) -> String {
     format!("{:04}", seconds % 10_000)
 }
 
+/// The address to advertise for a `server.host` setting.
+///
+/// A specific bind address is advertised as is, because nothing else is
+/// listening. Route detection is only used for wildcard binds (and host names,
+/// which cannot be advertised directly). Loopback is never advertised.
+fn advertised_address(host: &str) -> Option<IpAddr> {
+    match host.trim().parse::<IpAddr>() {
+        Ok(address) if address.is_loopback() => None,
+        Ok(address) if !address.is_unspecified() => Some(address),
+        _ => Some(IpAddr::V4(local_ipv4())),
+    }
+}
+
 fn local_ipv4() -> Ipv4Addr {
     // Connecting a UDP socket only selects a route; no packets are sent.
     let probe: std::io::Result<SocketAddr> = (|| {
@@ -141,5 +161,36 @@ fn local_ipv4() -> Ipv4Addr {
     match probe {
         Ok(SocketAddr::V4(address)) => *address.ip(),
         _ => Ipv4Addr::LOCALHOST,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_specific_bind_address_is_advertised_as_is() {
+        assert_eq!(
+            advertised_address("192.168.1.50"),
+            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)))
+        );
+        assert_eq!(
+            advertised_address(" fd00::1 "),
+            Some("fd00::1".parse().expect("ipv6"))
+        );
+    }
+
+    #[test]
+    fn loopback_is_never_advertised() {
+        assert_eq!(advertised_address("127.0.0.1"), None);
+        assert_eq!(advertised_address("::1"), None);
+    }
+
+    #[test]
+    fn wildcard_binds_fall_back_to_route_detection() {
+        for host in ["0.0.0.0", "::", "my-host.example"] {
+            let address = advertised_address(host).expect("an address");
+            assert!(!address.is_unspecified());
+        }
     }
 }

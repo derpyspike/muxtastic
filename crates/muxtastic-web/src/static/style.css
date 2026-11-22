@@ -271,8 +271,8 @@ footer {
   footer { padding: 0 16px 20px; flex-direction: column; }
 }
 
-th[data-sort] { cursor: pointer; user-select: none; }
-th[data-sort]:hover { color: var(--text); }
+th[data-sort], th[data-jsort] { cursor: pointer; user-select: none; }
+th[data-sort]:hover, th[data-jsort]:hover { color: var(--text); }
 th.sorted { color: var(--accent); }
 #nodes-body tr { cursor: pointer; }
 
@@ -325,3 +325,54 @@ a.button { display: inline-block; text-decoration: none; }
 .source-card .source-direct { margin-top: 8px; border-top: 1px solid var(--border); padding-top: 6px; }
 .source-card .source-direct summary { cursor: pointer; color: var(--muted); font-size: 11px; }
 .source-card .source-direct .detail-table { margin-top: 8px; }
+
+/* Suspect data (bad clocks, impossible hops/coordinates) stays visible, in red. */
+.bad-value, .bad-value b { color: var(--red) !important; font-weight: 600; }
+.trace-node.unknown { border-style: dashed; border-color: rgba(243, 139, 168, 0.6); color: var(--red); }
+.paused-note { color: var(--amber); }
+
+/* Mesh-supplied names may be right-to-left; keep them from reordering neighbours. */
+body :is(span, b, strong, td, th, summary, option, .trace-node, .sender) { unicode-bidi: isolate; }
+
+/* Keyboard access to sortable headers, node rows and tabs. */
+th[data-sort]:focus-visible, th[data-jsort]:focus-visible, .subtabs button:focus-visible, #nodes-body tr:focus-visible, .tabs button:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: -2px;
+}
+
+/* MeshCore paths and hashes */
+.mc-path { min-width: 260px; max-width: 520px; line-height: 1.5; }
+.raw .mc-path { min-width: 0; max-width: none; }
+.hash-match.unknown { color: var(--muted); }
+.hash-match.ambiguous { color: var(--amber); }
+.hash-match .mono { font-size: 11px; }
+
+/* Map */
+.map { height: calc(100vh - 230px); min-height: 360px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel-2); z-index: 0; }
+.map-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; border: 1px solid var(--panel-2); }
+.map-dot.meshtastic { background: var(--green); }
+.map-dot.repeater { background: var(--blue); }
+.map-dot.room { background: var(--purple); }
+.map-dot.meshcore { background: var(--peach); }
+/* Leaflet's stylesheet loads after this one, hence the extra .map specificity. */
+.map.leaflet-container { font: inherit; background: var(--panel-2); }
+.map .leaflet-popup-content-wrapper, .map .leaflet-popup-tip, .map .leaflet-tooltip { background: var(--panel); color: var(--text); border: 1px solid var(--border); box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5); }
+.map .leaflet-tooltip::before { display: none; }
+.map .leaflet-popup-content { margin: 10px 14px; font-size: 13px; line-height: 1.5; }
+.map.leaflet-container a.leaflet-popup-close-button { color: var(--muted); }
+.map-popup strong { display: block; margin-bottom: 4px; }
+.map-popup .button { margin-top: 8px; }
+.map .leaflet-control-attribution { font-size: 11px; }
+
+/* Network switch inside a tab */
+.subtabs { display: flex; gap: 6px; margin-bottom: 14px; flex-wrap: wrap; }
+.subtabs button { background: var(--panel); color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 6px 14px; font: inherit; font-size: 13px; cursor: pointer; }
+.subtabs button:hover { color: var(--text); }
+.subtabs button.active { color: var(--panel-2); background: var(--accent); border-color: var(--accent); font-weight: 600; }
+#stats-jraw > .block { margin-bottom: 16px; }
+
+/* MeshCore path under a chat message */
+.chat-path { font-size: 12px; margin-top: 6px; line-height: 1.6; }
+.chat-path .mc-path { min-width: 0; max-width: none; }
+
+/* Decrypted MeshCore text in the packet list wraps instead of being cut off. */
+.packet-contents.readable { white-space: normal; overflow: visible; min-width: 220px; max-width: 420px; color: var(--text); }

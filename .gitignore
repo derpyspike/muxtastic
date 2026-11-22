@@ -12,6 +12,7 @@ configs/site-*.toml
 # Runtime
 logs/
 data/
+data-*/
 *.log
 
 # OS

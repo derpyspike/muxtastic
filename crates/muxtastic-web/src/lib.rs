@@ -12,9 +12,9 @@ mod util;
 
 pub use db::{
     run_writer, ChannelCount, ChannelInfo, ChannelNodeCount, CountBucket, Database, DbReceiver,
-    DbSource, DbWrite, DirectNode, HourBucket, JrawNode, Message, MqttGateway, Node, NodeCount,
+    DbSource, DbWrite, DirectNode, HashMatch, HourBucket, JrawNode, JrawStats, MeshCoreReception, Message, MqttGateway, Node, NodeCount,
     NodeName, PacketFilter, PacketFilterOption, PacketFilterOptions, PacketListEntry, PacketRow,
-    RawFrame, Reception, Stats, Totals, Traceroute,
+    RawFilter, RawFilterOptions, RawFrame, Reception, Stats, Totals, TraceHop, Traceroute,
 };
 pub use mqtt_source::{run as run_mqtt_source, GatewayFilter};
 pub use server::{

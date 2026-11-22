@@ -10,8 +10,10 @@ description = "Transport-agnostic Meshtastic multiplexer logic"
 aes = "0.8"
 base64 = "0.22"
 ctr = "0.9"
+hmac = "0.12"
 meshtastic = { workspace = true }
 serde = { workspace = true }
+sha2 = "0.10"
 thiserror = { workspace = true }
 
 [dev-dependencies]

@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, e.g. v0.1.0"
+        description: "Existing tag to release, e.g. v0.2.0 (must match the Cargo version)"
         required: true
         type: string
       draft:
@@ -22,8 +22,42 @@ permissions:
   contents: write
 
 jobs:
+  verify:
+    name: Verify tag and run tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake gcc libc6-dev make pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check that the tag matches the Cargo version
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --no-deps --locked --format-version 1 \
+            | jq -r '.packages[] | select(.name == "muxtastic") | .version')"
+          if [[ "${TAG#v}" != "${version}" ]]; then
+            echo "::error::tag ${TAG} does not match the Cargo version ${version}"
+            exit 1
+          fi
+          echo "Releasing muxtastic ${version} from tag ${TAG}"
+
+      - run: cargo test --workspace --locked
+
   build:
     name: Build ${{ matrix.name }}
+    needs: verify
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -41,6 +75,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
 
       - name: Install native build dependencies

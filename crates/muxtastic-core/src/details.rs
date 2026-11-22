@@ -120,7 +120,7 @@ pub fn lora_details(lora: &pb::config::LoRaConfig, channel_name: &str) -> LoraDe
             let index = if lora.channel_num != 0 {
                 u64::from(lora.channel_num - 1)
             } else {
-                djb2(channel_name)
+                u64::from(djb2(hash_channel_name(lora, channel_name)))
             };
             let index = index % channels;
 
@@ -186,6 +186,10 @@ fn bandwidth_code_to_khz(code: u32) -> f32 {
         0 => 125.0,
         31 => 31.25,
         62 => 62.5,
+        200 => 203.125,
+        400 => 406.25,
+        800 => 812.5,
+        1600 => 1625.0,
         other => other as f32,
     }
 }
@@ -195,7 +199,7 @@ fn preset_params(preset: i32) -> (f32, u32, u32, Option<&'static str>) {
         0 => (250.0, 11, 5, "LONG_FAST"),
         1 => (125.0, 12, 8, "LONG_SLOW"),
         2 => (62.5, 12, 8, "VERY_LONG_SLOW"),
-        3 => (125.0, 10, 5, "MEDIUM_SLOW"),
+        3 => (250.0, 10, 5, "MEDIUM_SLOW"),
         4 => (250.0, 9, 5, "MEDIUM_FAST"),
         5 => (250.0, 8, 5, "SHORT_SLOW"),
         6 => (250.0, 7, 5, "SHORT_FAST"),
@@ -240,10 +244,38 @@ fn region_band(region: i32) -> Option<(f32, f32, &'static str)> {
     })
 }
 
-fn djb2(value: &str) -> u64 {
-    let mut hash = 5381u64;
+/// The name the firmware hashes to pick the frequency slot. An unnamed
+/// primary channel (the stock default) hashes as the preset's display name,
+/// or as "Custom" when no preset is in use.
+fn hash_channel_name<'a>(lora: &pb::config::LoRaConfig, channel_name: &'a str) -> &'a str {
+    if !channel_name.is_empty() {
+        return channel_name;
+    }
+    if !lora.use_preset {
+        return "Custom";
+    }
+    match lora.modem_preset {
+        0 => "LongFast",
+        1 => "LongSlow",
+        2 => "VLongSlow",
+        3 => "MediumSlow",
+        4 => "MediumFast",
+        5 => "ShortSlow",
+        6 => "ShortFast",
+        7 => "LongMod",
+        8 => "ShortTurbo",
+        9 => "LongTurbo",
+        _ => "Invalid",
+    }
+}
+
+/// djb2, 32-bit like the firmware's `uint32_t hash(const char *)`. The width
+/// matters: the slot is `hash % channels`, and a 64-bit hash gives a different
+/// remainder whenever the channel count is not a power of two.
+fn djb2(value: &str) -> u32 {
+    let mut hash = 5381u32;
     for byte in value.bytes() {
-        hash = hash.wrapping_mul(33).wrapping_add(u64::from(byte));
+        hash = hash.wrapping_mul(33).wrapping_add(u32::from(byte));
     }
     hash
 }
@@ -288,6 +320,43 @@ mod tests {
         let details = lora_details(&lora(true, 0, 0, 0, 0), "LongFast");
         assert_eq!(details.summary, "SF11/250/CR5/869.525");
         assert_eq!(details.preset.as_deref(), Some("LONG_FAST"));
+    }
+
+    #[test]
+    fn default_slots_match_the_firmware_in_wide_regions() {
+        // US, 902-928 MHz. The published default slots are LongFast 20,
+        // MediumFast 45, MediumSlow 52, ShortFast 68, LongSlow 27.
+        let us = |preset: i32, name: &str| {
+            let mut config = lora(true, preset, 0, 0, 0);
+            config.region = 1;
+            lora_details(&config, name)
+        };
+
+        let long_fast = us(0, "LongFast");
+        assert_eq!(long_fast.channel_num, Some(19));
+        let frequency = long_fast.frequency_mhz.expect("frequency");
+        assert!((frequency - 906.875).abs() < 0.001, "{frequency}");
+
+        // An unnamed primary channel hashes as the preset name.
+        assert_eq!(us(0, "").channel_num, Some(19));
+        assert_eq!(us(4, "").channel_num, Some(44));
+        assert_eq!(us(3, "").channel_num, Some(51));
+        assert_eq!(us(6, "").channel_num, Some(67));
+        assert_eq!(us(1, "").channel_num, Some(26));
+        assert_eq!(us(3, "").bandwidth_khz, 250.0);
+
+        // An explicit name still wins over the preset.
+        assert_eq!(us(0, "MediumFast").channel_num, Some(44));
+    }
+
+    #[test]
+    fn maps_the_wide_bandwidth_codes() {
+        assert_eq!(bandwidth_code_to_khz(200), 203.125);
+        assert_eq!(bandwidth_code_to_khz(400), 406.25);
+        assert_eq!(bandwidth_code_to_khz(800), 812.5);
+        assert_eq!(bandwidth_code_to_khz(1600), 1625.0);
+        assert_eq!(bandwidth_code_to_khz(250), 250.0);
+        assert_eq!(bandwidth_code_to_khz(0), 125.0);
     }
 
     #[test]

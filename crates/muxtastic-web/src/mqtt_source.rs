@@ -12,7 +12,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use meshtastic::protobufs::{self as pb, from_radio};
 use meshtastic::Message;
@@ -29,6 +29,11 @@ use crate::Database;
 
 /// JRAW frames fit two 247-byte chunks; anything larger is not a feed frame.
 const MAX_RAW_FRAME: usize = 512;
+/// Largest broker message accepted. Bigger ones (someone's retained blob on a
+/// shared broker) would otherwise end the session with a protocol error.
+const MAX_INCOMING_PACKET: usize = 256 * 1024;
+/// A session must last this long before the reconnect backoff starts over.
+const STABLE_SESSION: Duration = Duration::from_secs(30);
 
 /// Optional predicate for ignoring packets published by one of the local
 /// bridges, so the read-only source does not duplicate their history.
@@ -63,7 +68,12 @@ pub async fn run(
             options.set_transport(Transport::tls_with_config(TlsConfiguration::default()));
         }
 
-        let (client, mut eventloop) = AsyncClient::new(options, 10);
+        options.set_max_packet_size(MAX_INCOMING_PACKET, MAX_INCOMING_PACKET);
+
+        // Subscriptions are queued from inside the poll loop, so the request
+        // queue must hold all of them or the loop would wait on itself.
+        let (client, mut eventloop) = AsyncClient::new(options, config.topics.len() + 16);
+        let mut session_started: Option<Instant> = None;
         info!(
             broker = %config.broker,
             port = config.port,
@@ -84,11 +94,11 @@ pub async fn run(
                     match event {
                         Ok(Event::Incoming(Packet::ConnAck(_))) => {
                             connected.store(true, Ordering::SeqCst);
-                            backoff = 1;
+                            session_started = Some(Instant::now());
                             info!("web MQTT source connected");
                             for topic in &config.topics {
                                 if let Err(error) =
-                                    client.subscribe(topic.as_str(), QoS::AtMostOnce).await
+                                    client.try_subscribe(topic.as_str(), QoS::AtMostOnce)
                                 {
                                     warn!(topic, %error, "web MQTT source subscribe failed");
                                 }
@@ -106,6 +116,15 @@ pub async fn run(
                                 skip_gateway.as_deref(),
                             );
                         }
+                        Ok(Event::Incoming(Packet::SubAck(ack))) => {
+                            if ack
+                                .return_codes
+                                .iter()
+                                .any(|code| matches!(code, rumqttc::SubscribeReasonCode::Failure))
+                            {
+                                warn!("web MQTT source: the broker rejected a subscription");
+                            }
+                        }
                         Ok(_) => {}
                         Err(error) => {
                             warn!(%error, "web MQTT source connection lost");
@@ -119,6 +138,11 @@ pub async fn run(
         connected.store(false, Ordering::SeqCst);
         if *shutdown.borrow() {
             break;
+        }
+        // Only a session that stayed up counts as recovered; one that dies
+        // right after connecting keeps backing off.
+        if session_started.is_some_and(|started| started.elapsed() >= STABLE_SESSION) {
+            backoff = 1;
         }
         info!(seconds = backoff, "web MQTT source reconnecting");
         tokio::select! {
@@ -196,36 +220,21 @@ fn ingest(db: &Database, topic: &str, payload: &[u8], skip_gateway: Option<&Gate
         packet.transport_mechanism = pb::mesh_packet::TransportMechanism::TransportMqtt as i32;
     }
 
+    // The channel name travels in the envelope and in the topic. Pass it along
+    // by name and leave `packet.channel` alone: for an encrypted packet it is
+    // the channel hash, which decryption needs.
+    let channel_name = if envelope.channel_id.is_empty() {
+        msh_channel_name(topic).map(str::to_owned)
+    } else {
+        Some(envelope.channel_id)
+    };
     let receiver = if envelope.gateway_id.is_empty() {
-        gateway_from_topic(topic).map(|gateway| format!("!{gateway:08x}"))
+        topic_gateway
     } else {
         Some(envelope.gateway_id)
     };
 
-    if let Some(channel_name) = msh_channel_name(topic) {
-        let index = channel_index(channel_name);
-        packet.channel = index;
-
-        let channel = pb::Channel {
-            index: index as i32,
-            role: pb::channel::Role::Secondary as i32,
-            settings: Some(pb::ChannelSettings {
-                name: channel_name.to_owned(),
-                ..Default::default()
-            }),
-        };
-        db.record_frame(
-            pb::FromRadio {
-                id: 0,
-                payload_variant: Some(from_radio::PayloadVariant::Channel(channel)),
-            },
-            None,
-            DbSource::Mqtt,
-            receiver.clone(),
-        );
-    }
-
-    db.record_frame(
+    db.record_frame_on_channel(
         pb::FromRadio {
             id: 0,
             payload_variant: Some(from_radio::PayloadVariant::Packet(packet)),
@@ -233,6 +242,7 @@ fn ingest(db: &Database, topic: &str, payload: &[u8], skip_gateway: Option<&Gate
         None,
         DbSource::Mqtt,
         receiver,
+        channel_name,
     );
 }
 
@@ -257,42 +267,30 @@ fn gateway_from_topic(topic: &str) -> Option<u32> {
     u32::from_str_radix(hex, 16).ok()
 }
 
+/// Channel name from `msh/{region...}/2/e/{channel}/!gateway`. The region may
+/// span several levels (`msh/EU_868/DE/2/e/...`).
 fn msh_channel_name(topic: &str) -> Option<&str> {
     let mut parts = topic.split('/');
     if parts.next()? != "msh" {
         return None;
     }
-    let _region = parts.next()?;
-    if parts.next()? != "2" {
+    let parts: Vec<&str> = parts.collect();
+    let marker = parts
+        .windows(2)
+        .position(|pair| pair[0] == "2" && pair[1] == "e")?;
+    // At least one region level must come before the "2/e" marker.
+    if marker == 0 {
         return None;
     }
-    if parts.next()? != "e" {
-        return None;
-    }
-    let name = parts.next()?;
-    if name.is_empty() {
-        None
-    } else {
-        Some(name)
-    }
-}
-
-/// Stable channel bucket for MQTT topic names. The real local channel index is
-/// not meaningful across brokers, so the dashboard uses a deterministic name
-/// bucket and records the name in the `channels` table.
-fn channel_index(name: &str) -> u32 {
-    let mut hash = 0x811C_9DC5u32;
-    for byte in name.as_bytes() {
-        hash ^= u32::from(*byte);
-        hash = hash.wrapping_mul(0x0100_0193);
-    }
-    hash % 256
+    parts
+        .get(marker + 2)
+        .copied()
+        .filter(|name| !name.is_empty() && !name.starts_with('!'))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
 
     #[test]
     fn skips_local_gateway_ids() {
@@ -323,10 +321,13 @@ mod tests {
             msh_channel_name("msh/EU_868/2/e/LongFast/!11223344"),
             Some("LongFast")
         );
+        assert_eq!(
+            msh_channel_name("msh/EU_868/DE/2/e/LongFast/!11223344"),
+            Some("LongFast")
+        );
         assert_eq!(msh_channel_name("msh/EU_868/2/e/"), None);
+        assert_eq!(msh_channel_name("msh/EU_868/2/json/LongFast/!1"), None);
         assert_eq!(msh_channel_name("raw/EU_868/!11223344"), None);
-        assert_eq!(channel_index("LongFast"), channel_index("LongFast"));
-        assert_ne!(channel_index("LongFast"), channel_index("MediumFast"));
     }
 
     #[tokio::test]

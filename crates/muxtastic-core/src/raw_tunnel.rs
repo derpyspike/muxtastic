@@ -167,8 +167,8 @@ impl Partial {
             gateway: packet.from,
             channel: packet.channel,
             rx_time: packet.rx_time,
-            rssi: Some(packet.rx_rssi),
-            snr: Some(packet.rx_snr),
+            rssi: rx_rssi(packet),
+            snr: rx_snr(packet),
             frequency_error: diagnostics.frequency_error,
             coding_rate: diagnostics.coding_rate,
         }
@@ -181,6 +181,20 @@ impl Partial {
         }
         Some(frame)
     }
+}
+
+/// A packet with RSSI and SNR both zero carries no RF metadata (a real
+/// reception never reports 0 dBm), so neither value is reported.
+fn has_rf_metadata(packet: &pb::MeshPacket) -> bool {
+    packet.rx_rssi != 0 || packet.rx_snr != 0.0
+}
+
+fn rx_rssi(packet: &pb::MeshPacket) -> Option<i32> {
+    has_rf_metadata(packet).then_some(packet.rx_rssi)
+}
+
+fn rx_snr(packet: &pb::MeshPacket) -> Option<f32> {
+    has_rf_metadata(packet).then_some(packet.rx_snr)
 }
 
 /// Reassembles one- and two-chunk JRAW frames, keyed by kind, sequence and
@@ -220,8 +234,8 @@ impl RawTunnelAssembler {
                 gateway: packet.from,
                 channel: packet.channel,
                 rx_time: packet.rx_time,
-                rssi: Some(packet.rx_rssi),
-                snr: Some(packet.rx_snr),
+                rssi: rx_rssi(packet),
+                snr: rx_snr(packet),
                 frequency_error: diagnostics.frequency_error,
                 coding_rate: diagnostics.coding_rate,
             });
@@ -244,8 +258,8 @@ impl RawTunnelAssembler {
         partial.gateway = packet.from;
         partial.channel = packet.channel;
         partial.rx_time = packet.rx_time;
-        partial.rssi = Some(packet.rx_rssi);
-        partial.snr = Some(packet.rx_snr);
+        partial.rssi = rx_rssi(packet);
+        partial.snr = rx_snr(packet);
         partial.frequency_error = diagnostics.frequency_error;
         partial.coding_rate = diagnostics.coding_rate;
         partial.chunks[chunk.index as usize] = Some(chunk.bytes);
@@ -400,6 +414,48 @@ pub struct MeshCoreInfo {
     pub public_key: Option<Vec<u8>>,
     pub node_name: Option<String>,
     pub node_type: Option<u8>,
+    /// Region scope codes of a transport-routed frame (`[scope, return]`).
+    pub transport_codes: Option<[u16; 2]>,
+    /// Offset of the payload inside the frame.
+    pub payload_at: usize,
+    /// Advertised position in degrees × 1e6, as sent (0, 0 means "not set").
+    pub advert_position: Option<(i32, i32)>,
+    /// Sender's clock when the advert was signed (Unix seconds).
+    pub advert_timestamp: Option<u32>,
+    pub trace: Option<MeshCoreTrace>,
+}
+
+/// A TRACE frame: the route it was asked to follow and the SNR each hop saw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshCoreTrace {
+    pub tag: u32,
+    pub flags: u8,
+    /// Hex hash of every hop on the requested route.
+    pub route: Vec<String>,
+    /// SNR in quarter dB recorded by each hop that has forwarded it so far.
+    pub snr_quarters: Vec<i8>,
+}
+
+impl MeshCoreInfo {
+    /// The payload bytes of `frame`, the frame this info was parsed from.
+    pub fn payload<'a>(&self, frame: &'a [u8]) -> &'a [u8] {
+        frame.get(self.payload_at..).unwrap_or(&[])
+    }
+
+    /// Path entries as hex hashes, in the order they appear on air. Empty for
+    /// TRACE frames, whose path bytes are SNR readings rather than hashes.
+    pub fn path_hashes(&self) -> Vec<String> {
+        if self.trace.is_some() {
+            return Vec::new();
+        }
+        let width = usize::from(self.path_hash_size.max(1)) * 2;
+        self.path_hex
+            .as_bytes()
+            .chunks(width)
+            .filter_map(|chunk| std::str::from_utf8(chunk).ok())
+            .map(str::to_owned)
+            .collect()
+    }
 }
 
 pub fn meshcore_route_name(route: u8) -> &'static str {
@@ -444,10 +500,15 @@ pub fn parse_meshcore_frame(frame: &[u8]) -> Option<MeshCoreInfo> {
     let payload_type = (header >> 2) & 0x0F;
 
     let mut offset = 1;
+    let mut transport_codes = None;
     if route_type == 0 || route_type == 3 {
         if offset + 4 > frame.len() {
             return None;
         }
+        transport_codes = Some([
+            u16::from_le_bytes([frame[offset], frame[offset + 1]]),
+            u16::from_le_bytes([frame[offset + 2], frame[offset + 3]]),
+        ]);
         offset += 4;
     }
     if offset >= frame.len() {
@@ -469,7 +530,9 @@ pub fn parse_meshcore_frame(frame: &[u8]) -> Option<MeshCoreInfo> {
     for chunk in frame[offset..offset + path_bytes].chunks(hash_size as usize) {
         path_hex.push_str(&hex(chunk));
     }
+    let path = &frame[offset..offset + path_bytes];
     offset += path_bytes;
+    let payload_at = offset;
     let payload = &frame[offset..];
 
     let mut sender_hash = None;
@@ -479,10 +542,14 @@ pub fn parse_meshcore_frame(frame: &[u8]) -> Option<MeshCoreInfo> {
     let mut node_name = None;
     let mut node_type = None;
     let mut payload_text = None;
+    let mut advert_position = None;
+    let mut advert_timestamp = None;
+    let mut trace = None;
 
     const ADVERT_APP_DATA_AT: usize = 32 + 4 + 64;
     match payload_type {
-        0x02 | 0x08 if payload.len() >= 2 => {
+        // REQ, RESPONSE, TXT_MSG and PATH all start with destination + source.
+        0x00 | 0x01 | 0x02 | 0x08 if payload.len() >= 2 => {
             destination_hash = Some(hex(&payload[0..1]));
             sender_hash = Some(hex(&payload[1..2]));
             if payload_type == 0x02 {
@@ -495,11 +562,41 @@ pub fn parse_meshcore_frame(frame: &[u8]) -> Option<MeshCoreInfo> {
                 payload_text = printable_text(&payload[1..]);
             }
         }
+        // ANON_REQ: destination hash, then the sender's full public key.
+        0x07 if payload.len() > 32 => {
+            destination_hash = Some(hex(&payload[0..1]));
+            sender_hash = Some(hex(&payload[1..2]));
+            public_key = Some(payload[1..33].to_vec());
+        }
+        // TRACE: tag, auth code, flags, then the requested route. The path
+        // field holds one SNR byte per hop that has forwarded the frame.
+        0x09 if payload.len() >= 9 => {
+            let flags = payload[8];
+            let width = 1usize << (flags & 0x03);
+            trace = Some(MeshCoreTrace {
+                tag: u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]),
+                flags,
+                route: payload[9..].chunks_exact(width).map(hex).collect(),
+                snr_quarters: path.iter().map(|byte| *byte as i8).collect(),
+            });
+        }
         0x04 if payload.len() > ADVERT_APP_DATA_AT => {
             let flags = payload[ADVERT_APP_DATA_AT];
             node_type = Some(flags & 0x0F);
+            advert_timestamp = Some(u32::from_le_bytes([
+                payload[32],
+                payload[33],
+                payload[34],
+                payload[35],
+            ]));
             let mut at = ADVERT_APP_DATA_AT + 1;
             if flags & 0x10 != 0 {
+                if let Some(bytes) = payload.get(at..at + 8) {
+                    advert_position = Some((
+                        i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+                        i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+                    ));
+                }
                 at += 8;
             }
             if flags & 0x20 != 0 {
@@ -509,7 +606,14 @@ pub fn parse_meshcore_frame(frame: &[u8]) -> Option<MeshCoreInfo> {
                 at += 2;
             }
             if flags & 0x80 != 0 && at < payload.len() {
-                let name = String::from_utf8_lossy(&payload[at..]).trim().to_owned();
+                // Names come straight off the air: drop control characters
+                // (escape sequences, NULs, newlines) before they reach logs,
+                // the database or the UI.
+                let name: String = String::from_utf8_lossy(&payload[at..])
+                    .chars()
+                    .filter(|ch| !ch.is_control())
+                    .collect();
+                let name = name.trim().to_owned();
                 if !name.is_empty() {
                     node_name = Some(name);
                 }
@@ -535,6 +639,11 @@ pub fn parse_meshcore_frame(frame: &[u8]) -> Option<MeshCoreInfo> {
         public_key,
         node_name,
         node_type,
+        transport_codes,
+        payload_at,
+        advert_position,
+        advert_timestamp,
+        trace,
     })
 }
 
@@ -702,6 +811,49 @@ mod tests {
         assert!(parse_chunk(b"JRAW\x01\x01\x01\x00\x00x").is_none());
         assert!(parse_chunk(b"JRAW\x01\x01\x01\x00\x03x").is_none());
         assert!(parse_chunk(b"JRAW\x01\x01\x01\x01\x01x").is_none());
+    }
+
+    #[test]
+    fn missing_rf_metadata_is_reported_as_none() {
+        let mut assembler = RawTunnelAssembler::new();
+        let mut single = packet(jraw(1, 9, 0, 1, b"x"));
+        single.rx_rssi = 0;
+        single.rx_snr = 0.0;
+        let AssemblerResult::Complete(frame) = accept(&mut assembler, &single, 0) else {
+            panic!("expected a complete frame");
+        };
+        assert_eq!(frame.rssi, None);
+        assert_eq!(frame.snr, None);
+
+        // Two chunks: the metadata of the last chunk wins, including "none".
+        let mut tail = packet(jraw(1, 10, 1, 2, b"B"));
+        tail.rx_rssi = 0;
+        tail.rx_snr = 0.0;
+        accept(&mut assembler, &packet(jraw(1, 10, 0, 2, b"A")), 1);
+        let AssemblerResult::Complete(frame) = accept(&mut assembler, &tail, 2) else {
+            panic!("expected a complete frame");
+        };
+        assert_eq!(frame.rssi, None);
+        assert_eq!(frame.snr, None);
+
+        // A real reception with SNR 0 dB keeps both values.
+        let mut zero_snr = packet(jraw(1, 11, 0, 1, b"x"));
+        zero_snr.rx_snr = 0.0;
+        let AssemblerResult::Complete(frame) = accept(&mut assembler, &zero_snr, 3) else {
+            panic!("expected a complete frame");
+        };
+        assert_eq!(frame.rssi, Some(-50));
+        assert_eq!(frame.snr, Some(0.0));
+    }
+
+    #[test]
+    fn meshcore_advert_names_drop_control_characters() {
+        let mut frame = vec![(4 << 2) | 2, 0x00];
+        frame.extend_from_slice(&[0u8; 100]);
+        frame.push(0x80); // flags: has name
+        frame.extend_from_slice(b"No\x1b[31mde\0\n");
+        let info = parse_meshcore_frame(&frame).expect("parse advert");
+        assert_eq!(info.node_name.as_deref(), Some("No[31mde"));
     }
 
     #[test]

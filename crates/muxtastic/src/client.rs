@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -16,8 +17,18 @@ use tracing::{debug, info, warn};
 
 use crate::app::AppState;
 
-const CLIENT_IDLE: Duration = Duration::from_secs(300);
+/// Disconnect a client that sends nothing for this long. Well above the 300 s
+/// heartbeat interval some client libraries use.
+const CLIENT_IDLE: Duration = Duration::from_secs(900);
 const CONFIG_COOLDOWN: Duration = Duration::from_secs(5);
+/// One frame must reach the client's socket within this time.
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the handler waits for room in a client's outbound queue.
+const CLIENT_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+/// Grace period for queued frames to flush when a client is closed.
+const CLIENT_FLUSH_GRACE: Duration = Duration::from_secs(1);
+/// How long a config request waits for the physical node's first config dump.
+const SYNC_WAIT: Duration = Duration::from_secs(10);
 
 /// Serve one connected app.
 pub async fn handle(state: Arc<AppState>, id: u64, socket: TcpStream, peer: SocketAddr) {
@@ -34,13 +45,18 @@ pub async fn handle(state: Arc<AppState>, id: u64, socket: TcpStream, peer: Sock
                 let Ok(frame) = encode_frame(&payload) else {
                     continue;
                 };
-                if writer.write_all(&frame).await.is_err() {
-                    break;
+                let write = async {
+                    writer.write_all(&frame).await?;
+                    writer.flush().await
+                };
+                match tokio::time::timeout(CLIENT_WRITE_TIMEOUT, write).await {
+                    Ok(Ok(())) => state.client_tx(id, frame.len() as u64),
+                    Ok(Err(_)) => break,
+                    Err(_) => {
+                        warn!(client = id, "client is not reading; disconnecting");
+                        break;
+                    }
                 }
-                if writer.flush().await.is_err() {
-                    break;
-                }
-                state.client_tx(id, frame.len() as u64);
             }
         })
     };
@@ -83,15 +99,22 @@ pub async fn handle(state: Arc<AppState>, id: u64, socket: TcpStream, peer: Sock
                     break;
                 }
             }
+            // The writer task ended (write error or a client that stopped
+            // reading): nothing can reach this client any more.
+            _ = out_tx.closed() => {
+                debug!(client = id, "client writer stopped");
+                break;
+            }
             result = read => {
                 match result {
                     Ok(Ok(0)) => break,
                     Ok(Ok(n)) => {
                         state.client_rx(id, n as u64);
                         decoder.push(&buffer[..n]);
+                        let mut alive = true;
                         while let Some(payload) = decoder.next_frame() {
                             state.client_rx_frame(id);
-                            handle_to_radio(
+                            alive = handle_to_radio(
                                 &state,
                                 peer,
                                 id,
@@ -101,6 +124,13 @@ pub async fn handle(state: Arc<AppState>, id: u64, socket: TcpStream, peer: Sock
                                 &mut config_sent,
                             )
                             .await;
+                            if !alive {
+                                break;
+                            }
+                        }
+                        if !alive {
+                            warn!(client = id, "client is not draining its queue; disconnecting");
+                            break;
                         }
                     }
                     Ok(Err(error)) => {
@@ -116,9 +146,16 @@ pub async fn handle(state: Arc<AppState>, id: u64, socket: TcpStream, peer: Sock
         }
     }
 
-    drop(out_tx);
-    write_task.abort();
+    // Stop feeding the queue, give queued replies a moment to flush, then close.
     forward_task.abort();
+    drop(out_tx);
+    let mut write_task = write_task;
+    if tokio::time::timeout(CLIENT_FLUSH_GRACE, &mut write_task)
+        .await
+        .is_err()
+    {
+        write_task.abort();
+    }
     state.client_disconnected(id);
     info!(client = id, %peer, "client disconnected");
 }
@@ -131,10 +168,10 @@ async fn handle_to_radio(
     payload: &[u8],
     last_config: &mut Option<(u32, Instant)>,
     config_sent: &mut bool,
-) {
+) -> bool {
     let Ok(to_radio) = pb::ToRadio::decode(payload) else {
         debug!(%peer, "unparseable ToRadio frame");
-        return;
+        return true;
     };
 
     match &to_radio.payload_variant {
@@ -142,22 +179,28 @@ async fn handle_to_radio(
             if let Some((last_id, sent_at)) = last_config {
                 if config_id == last_id && sent_at.elapsed() < CONFIG_COOLDOWN {
                     info!(%peer, config_id, "throttled duplicate config request");
-                    return;
+                    return true;
                 }
             }
-            *last_config = Some((*config_id, Instant::now()));
-            send_replay(state, *config_id, out_tx).await;
-            *config_sent = true;
+            match send_replay(state, *config_id, out_tx).await {
+                Replay::Sent => {
+                    *last_config = Some((*config_id, Instant::now()));
+                    *config_sent = true;
+                }
+                // Stay silent so the app retries; do not throttle the retry.
+                Replay::NotSynced => *last_config = None,
+                Replay::ClientStalled => return false,
+            }
         }
         Some(to_radio::PayloadVariant::Heartbeat(_)) => {
-            let _ = out_tx.send(queue_status_reply()).await;
+            return send_to_client(out_tx, queue_status_reply()).await;
         }
         _ => {
             // Apps must request and receive the config replay before they are
             // allowed to send mesh traffic.
             if !*config_sent {
                 debug!(%peer, "ignoring message before the config replay");
-                return;
+                return true;
             }
 
             let context = ClientContext {
@@ -178,15 +221,19 @@ async fn handle_to_radio(
                     state.queue_to_node(bytes);
                 }
                 ClientAction::Reply(bytes) => {
-                    let _ = out_tx.send(bytes).await;
+                    if !send_to_client(out_tx, bytes).await {
+                        return false;
+                    }
                 }
                 ClientAction::Proxy {
                     topic,
                     payload,
-                    retained,
+                    retained: _,
                 } => {
+                    // A client may not leave retained messages on the broker
+                    // with the bridge's credentials.
                     if let Some(bridge) = state.mqtt_bridge() {
-                        if !bridge.publish_proxy(topic, payload, retained).await {
+                        if !bridge.publish_proxy(topic, payload, false).await {
                             debug!(%peer, "proxy publish was not delivered");
                         }
                     } else {
@@ -203,6 +250,32 @@ async fn handle_to_radio(
                 let _ = state.resync.try_send(());
             }
         }
+    }
+    true
+}
+
+/// Queue one frame for the client. False when the client is gone or has not
+/// drained its queue within [`CLIENT_SEND_TIMEOUT`].
+async fn send_to_client(out_tx: &mpsc::Sender<Vec<u8>>, payload: Vec<u8>) -> bool {
+    out_tx
+        .send_timeout(payload, CLIENT_SEND_TIMEOUT)
+        .await
+        .is_ok()
+}
+
+enum Replay {
+    Sent,
+    /// The physical node has not delivered a config yet; nothing was sent.
+    NotSynced,
+    /// The client stopped draining its queue.
+    ClientStalled,
+}
+
+/// Wait for the physical node's first config dump to complete.
+async fn wait_for_sync(state: &Arc<AppState>) {
+    let deadline = Instant::now() + SYNC_WAIT;
+    while !state.synced.load(Ordering::SeqCst) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -235,7 +308,25 @@ fn echo_locally(state: &Arc<AppState>, to_radio: &pb::ToRadio, client_id: u64) {
     state.broadcast_to_other_clients(from_radio.encode_to_vec(), client_id);
 }
 
-async fn send_replay(state: &Arc<AppState>, config_id: u32, out_tx: &mpsc::Sender<Vec<u8>>) {
+async fn send_replay(
+    state: &Arc<AppState>,
+    config_id: u32,
+    out_tx: &mpsc::Sender<Vec<u8>>,
+) -> Replay {
+    // With a real node, a replay built from an empty cache would hand the app
+    // a made-up identity. Wait for the node, else say nothing so the app
+    // retries. The mock fills the cache itself.
+    if !state.mock && !state.synced.load(Ordering::SeqCst) {
+        wait_for_sync(state).await;
+        if state.node_num() == 0 {
+            info!(
+                %config_id,
+                "physical node has not synced yet; not answering the config request"
+            );
+            return Replay::NotSynced;
+        }
+    }
+
     let messages = {
         let cache = state
             .cache
@@ -256,8 +347,9 @@ async fn send_replay(state: &Arc<AppState>, config_id: u32, out_tx: &mpsc::Sende
     );
 
     for message in messages {
-        if out_tx.send(message.encode_to_vec()).await.is_err() {
-            break;
+        if !send_to_client(out_tx, message.encode_to_vec()).await {
+            return Replay::ClientStalled;
         }
     }
+    Replay::Sent
 }

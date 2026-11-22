@@ -61,10 +61,13 @@ Ingestion rules:
 
 - `msh/#` and `raw/#`: decoded as `ServiceEnvelope` protobufs; the contained
   `MeshPacket` is recorded as packets/messages/nodes.
-- `msh/{region}/2/e/{channel}/...`: the channel name is recorded so the Chat
-  filter uses readable names. Packet channel indexes are bucketed from a stable
-  hash of the channel name because the local index is not meaningful across
-  brokers.
+- `msh/{region}/2/e/{channel}/...`: the channel name is taken from the
+  envelope's `channel_id`, or from the topic (the region may span several
+  levels, e.g. `msh/EU_868/DE/2/e/...`), and stored with the packet so the Chat
+  filter uses readable names. The packet's own channel field is left untouched.
+- A reception that is byte-identical to one already stored (same receiver,
+  relay, hop limit, receive time and signal values) is a broker redelivery and
+  is not stored again.
 - `jencore/#` and `jenrnode/#`: the payload is stored as a reassembled raw frame
   (`raw_frames`), using the `!nodeid` topic suffix as the gateway.
 - Retained messages are skipped to avoid replaying stale history.
@@ -114,6 +117,84 @@ Chat, Nodes, Channels, Receptions and the raw Meshtastic feed with the extra
 channel name and a `decrypted` marker. The Mesh Stats page has a separate
 `Decrypted` count.
 
+## MeshCore channels and regions
+
+MeshCore frames arrive through the Nexus `JRAW` tunnel (type 1). Group messages
+(`GRP_TXT`, `GRP_DATA`) are decrypted when their channel key is known:
+
+```toml
+[web]
+meshcore_regions = ["madrid", "es"]
+
+[[web.meshcore_channels]]
+name = "#madrid"            # hashtag channel: the key is derived from the name
+
+[[web.meshcore_channels]]
+name = "Family"             # private channel: 16- or 32-byte key, base64 or hex
+key = "…"
+```
+
+- The well-known **Public** channel is always tried; it needs no entry.
+- A `#hashtag` channel needs only its name. Its key is the first 16 bytes of
+  SHA-256 over the name, `#` included.
+- Any other channel needs its key. Invalid entries are logged and skipped.
+- A frame counts as decrypted only when its two-byte MAC matches. When a known
+  channel shares the frame's one-byte hash but the MAC fails, the UI shows that
+  channel's name with a `?`.
+
+Decrypted group text also appears in **Chat** on a channel named `JC:` plus the
+MeshCore channel name (`JC:Public`, `JC:#test`, …), each message once however
+many times it was heard. If a node already bridges MeshCore chat into
+Meshtastic channels with those names, a decrypted message whose text matches a
+bridged one on the same channel within 120 seconds is not listed a second time.
+
+Each such message shows the path its MeshCore frame took, with repeater names.
+A flooded message usually arrives several times over different paths: the first
+copy heard is shown inline and all copies are in an expandable list. A bridged
+Meshtastic copy gets the paths of its MeshCore twin.
+
+Decryption happens when frames are read, not when they are stored: adding a
+key later also decrypts frames already in the database, and no decrypted text
+is written to disk.
+
+Region-scoped frames (`transport-flood`, `transport-direct`) do not carry a
+region name, only a 16-bit code computed from the region key and the payload.
+Each name in `meshcore_regions` is tried (a leading `#` is optional); a match
+shows the region name, anything else shows the raw code. Private (`$name`)
+regions have keys that cannot be derived and stay unnamed. With a 16-bit code a
+configured region matches a foreign frame by chance about once in 65,536.
+
+Path hashes are resolved against the MeshCore nodes heard so far (repeaters and
+room servers only, since those forward). Hashes are one to three bytes long, so
+several known nodes can share one: the UI then lists the candidates in amber
+instead of picking one, and shows a bare hash when no known node matches. A
+flood frame's path is the repeaters it has passed, in order; a direct frame's
+path is the route still ahead; a `TRACE` frame shows its requested route with
+the SNR each hop has recorded so far.
+
+## Map
+
+The **Map** tab plots every Meshtastic node with a valid position and every
+MeshCore node that advertised one. Nodes without a position are counted in the
+toolbar; positions outside ±90°/±180° are counted in red with the node names in
+the tooltip and are not plotted. With 20 or more nodes the first view
+fits the middle 90% of them, so that a few far-away positions do not zoom it
+out to a continent.
+
+The map library (Leaflet 1.9.4, BSD-2-Clause) is embedded in the binary and
+loaded only when the tab is opened. **Map tiles are fetched by the browser
+straight from the tile server**, which therefore learns the viewer's IP address
+and the area being viewed:
+
+```toml
+[web]
+map_tile_url = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"   # default
+map_attribution = "© OpenStreetMap contributors"
+```
+
+Point `map_tile_url` at your own tile server to keep that private, or set it to
+`""` to show the markers on a plain background with no outside requests.
+
 ## Connected node header
 
 The header shows one card per physical node, to the right of the Muxtastic
@@ -135,7 +216,11 @@ no local node, so the row is hidden.
 
 ## Tabs
 
-- **Mesh Stats** — total packets, messages, nodes, payload bytes, raw frames,
+- **Mesh Stats** — a network switch for Meshtastic, MeshCore and Reticulum.
+  MeshCore shows frames, nodes, repeaters, distinct group messages, average
+  hops, payload types, routes, channels (`JC:` names, or the bare hash when no
+  key fits), top chat senders, busiest repeaters and regions; Reticulum shows
+  frames, announced destinations, packet types and contexts. Meshtastic: total packets, messages, nodes, payload bytes, raw frames,
   receptions and multi-heard packets; per-hour packet/byte counts for the last
   hour; a 24-hour packet chart; channel-mix and portnum pie charts; portnum,
   transport, channel and top-sender breakdowns with percentages; separate cards for the
@@ -153,7 +238,11 @@ no local node, so the row is hidden.
   node and hop data. The channel dropdown filters the log and omits opaque/PKI
   channels. Packets decoded with an extra channel key show a `decrypted` marker.
 - **Nodes** — a family switch for Meshtastic, MeshCore and Reticulum; MeshCore
-  and Reticulum lists come from stored JRAW adverts. Meshtastic nodes show name,
+  and Reticulum lists come from stored JRAW adverts and sort by any column.
+  MeshCore nodes that sent an
+  advert are listed by public key with their advertised position; entries with a
+  bare one-byte hash are senders seen only in frames that carry no key.
+  Meshtastic nodes show name,
   id, hardware, last-heard channel,
   `used_hops/hop_start`, battery, role, position and hearing gateways. Filter
   by role/source/hardware/channel, sort by any column (default last heard; hops
@@ -161,12 +250,21 @@ no local node, so the row is hidden.
   and its packet table. The dialog has an **Open in new tab** link to the
   standalone `/node/{num}` view. Node details also show per-source RSSI, SNR
   and frequency-error graphs across the recorded receptions.
+- **Map** — Meshtastic and MeshCore nodes with a known position; see [Map](#map).
 - **Packets** — family switch for Meshtastic packets, MeshCore JRAW and
   Reticulum JRAW. The Meshtastic table is protocol-oriented with time,
   sender/recipient, portnum, text contents, channel, hearing gateways, bytes,
-  RF metrics, source and decryption state. MeshCore/Reticulum tables show route,
-  payload, decoded text when present, path and path-hash size, node/sender
-  hashes and ADVERT node type (Companion, Repeater, Room Server, Sensor).
+  RF metrics, source and decryption state. The MeshCore table shows route,
+  payload, decrypted group text, the path with repeater names, sender and
+  destination, channel hash and name, region, and ADVERT node type and position
+  (see [MeshCore channels and regions](#meshcore-channels-and-regions)).
+  It filters by payload type, channel (named channels first, then bare hashes,
+  each with its frame count), decrypted or undecrypted group frames, region
+  (any region-scoped frame, one configured region, or an unknown code), route,
+  and free text over contents, node and repeater names, channels and hashes.
+  Filters that need the parsed frame (decryption, region, text) look through
+  the newest 50,000 frames of the feed. The Reticulum table filters by packet
+  type, context and text.
   Filter the Meshtastic table by protocol, canonical channel, gateway, source
   and decrypted/not decrypted.
 - **Channels** — per-channel packet count, payload bytes, packets/h, bytes/h and
@@ -215,8 +313,29 @@ stored on each packet/message/reception: different names at the same index stay
 separate, while the same name at different indexes is one logical channel.
 Channels without a known name fall back to `#index`, `Opaque 0xNN` or `PKI`.
 
-The page polls `/api/stats` every 3 seconds and refreshes the active tab. The
-status pills show physical link, MQTT state, connected clients and uptime.
+The page polls every 3 seconds and refreshes the active tab (`/api/stats` on the
+Mesh Stats and Channels tabs, `/api/status` plus that tab's endpoint elsewhere).
+The status pills show physical link, MQTT state, connected clients and uptime.
+
+Polling behaviour:
+
+- Polling stops while the browser tab is hidden and resumes when it is shown.
+- Every request times out after 15 seconds. Switching tabs, changing a filter or
+  pressing Refresh cancels the refresh in flight and starts a new one, so a late
+  response never overwrites a newer view.
+- A list is only rebuilt when its data changed; relative times ("5m ago") are
+  updated in place. `/api/node-names` is fetched at most every 30 seconds.
+- While a panel inside the active tab is expanded, that tab's list is not
+  rebuilt (the footer says so); the status header keeps updating. Refresh
+  forces a rebuild.
+
+Suspect values are shown in red instead of being hidden: timestamps in the
+future or before 2020, a chat message whose radio `rx_time` is more than an
+hour from the server receive time, hop fields with `hop_limit > hop_start`, and
+out-of-range coordinates. A position of exactly 0, 0 is shown as "no fix".
+Relative times use the server receive time. In the Traces tab a reply
+(`request_id` set) is drawn requester → target; unknown hops (`0xffffffff`) and
+unknown SNR (`-128`) are marked as unknown.
 
 ## HTTP API
 
@@ -224,6 +343,11 @@ status pills show physical link, MQTT state, connected clients and uptime.
 |---|---|
 | `GET /` | Dashboard |
 | `GET /static/app.js` | Dashboard script |
+| `GET /static/leaflet.js`, `/static/leaflet.css` | Embedded map library |
+| `GET /api/raw-filters?kind=1\|2` | Filter choices for a raw feed with frame counts |
+| `GET /api/raw?kind=…&payload=&route=&channel=&decrypted=&region=&q=` | The raw frame list accepts these optional filters |
+| `GET /api/jraw-stats?kind=1\|2` | MeshCore or Reticulum statistics for the Mesh Stats tab |
+| `GET /api/config` | Map tile source and the names (never keys) of the configured MeshCore channels and regions |
 | `GET /static/style.css` | Dashboard styles |
 | `GET /api/stats` | Live status, node cards, physical/MQTT sources, rates, percentages, channel/node breakdowns and channel list |
 | `GET /api/status` | Lightweight live status/source/client payload without database stats |
@@ -266,7 +390,7 @@ Tables:
 | `nodes` | Latest known node identity, RF metrics, battery, position, public key and latest ingestion source |
 | `channels` | Global channel index/name fallback |
 | `node_channels` | Per-receiver channel index/name map (since schema v9) |
-| `jraw_nodes` | MeshCore/Reticulum advert nodes, public keys and frame counts (schema v12) |
+| `jraw_nodes` | MeshCore/Reticulum advert nodes, public keys and frame counts (schema v12). Since schema v16 advertised MeshCore nodes are keyed by full public key and keep their advertised `latitude`/`longitude` |
 | `raw_frames` | Reassembled JRAW frames plus Meshtastic packet protobufs, kind/source, gateway, sequence, frame blob, MeshCore header fields, Nexus diagnostics and RF metrics |
 | `traceroutes` | Traceroute responses with direct `route`/`snr_towards` and back `route_back`/`snr_back` JSON arrays |
 

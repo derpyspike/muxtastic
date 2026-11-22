@@ -9,8 +9,8 @@
 
 use aes::{Aes128, Aes256};
 use base64::Engine;
-use ctr::cipher::{KeyIvInit, StreamCipher};
-use ctr::Ctr128BE;
+use ctr::cipher::{InnerIvInit, KeyInit, StreamCipher};
+use ctr::{Ctr128BE, CtrCore};
 use meshtastic::protobufs::{self as pb, mesh_packet};
 use meshtastic::Message;
 
@@ -21,13 +21,68 @@ const DEFAULT_PSK: [u8; 16] = [
     0xd4, 0xf1, 0xbb, 0x3a, 0x20, 0x29, 0x07, 0x59, 0xf0, 0xbc, 0xff, 0xab, 0xcf, 0x4e, 0x69, 0x01,
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ExtraChannel {
     pub name: String,
     pub wildcard: bool,
     expanded_key: Vec<u8>,
     raw_key: Vec<u8>,
     channel_hash: u8,
+    /// Key schedule, expanded once here instead of once per packet.
+    cipher: ChannelCipher,
+}
+
+/// The cipher is derived from `expanded_key`, so it takes no part in equality.
+impl PartialEq for ExtraChannel {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.wildcard == other.wildcard
+            && self.expanded_key == other.expanded_key
+            && self.raw_key == other.raw_key
+            && self.channel_hash == other.channel_hash
+    }
+}
+
+impl Eq for ExtraChannel {}
+
+#[derive(Clone)]
+enum ChannelCipher {
+    Aes128(Aes128),
+    Aes256(Aes256),
+}
+
+impl std::fmt::Debug for ChannelCipher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Aes128(_) => "Aes128(..)",
+            Self::Aes256(_) => "Aes256(..)",
+        })
+    }
+}
+
+impl ChannelCipher {
+    fn new(key: &[u8]) -> Result<Self, String> {
+        match key.len() {
+            16 => Aes128::new_from_slice(key).map(Self::Aes128),
+            32 => Aes256::new_from_slice(key).map(Self::Aes256),
+            _ => return Err("channel key must expand to 16 or 32 bytes".into()),
+        }
+        .map_err(|_| "channel key has an invalid length".to_owned())
+    }
+
+    /// AES-CTR over `bytes` in place, reusing the precomputed key schedule.
+    fn apply_ctr(&self, nonce: &[u8; 16], bytes: &mut [u8]) {
+        match self {
+            Self::Aes128(cipher) => {
+                Ctr128BE::<&Aes128>::from_core(CtrCore::inner_iv_init(cipher, nonce.into()))
+                    .apply_keystream(bytes)
+            }
+            Self::Aes256(cipher) => {
+                Ctr128BE::<&Aes256>::from_core(CtrCore::inner_iv_init(cipher, nonce.into()))
+                    .apply_keystream(bytes)
+            }
+        }
+    }
 }
 
 impl ExtraChannel {
@@ -47,6 +102,7 @@ impl ExtraChannel {
             return Err("channel name is empty".into());
         }
         let expanded_key = expand_key(&raw_key)?;
+        let cipher = ChannelCipher::new(&expanded_key)?;
         let wildcard = name == "*";
         let channel_hash = channel_hash(name.as_bytes(), &expanded_key);
         Ok(Self {
@@ -55,6 +111,7 @@ impl ExtraChannel {
             expanded_key,
             raw_key,
             channel_hash,
+            cipher,
         })
     }
 
@@ -76,24 +133,35 @@ impl ExtraChannel {
             || hint.is_some_and(|hint| hint == self.name)
     }
 
-    fn decrypt(&self, packet: &pb::MeshPacket) -> Option<pb::Data> {
-        let mesh_packet::PayloadVariant::Encrypted(encrypted) = packet.payload_variant.as_ref()?
-        else {
-            return None;
-        };
-        if packet.pki_encrypted || encrypted.is_empty() || encrypted.starts_with(b"JRAW") {
+    /// Decrypt `encrypted` into `scratch` (reused across attempts) and
+    /// return the payload when it is a believable `Data` message.
+    fn decrypt(
+        &self,
+        nonce: &[u8; 16],
+        encrypted: &[u8],
+        scratch: &mut Vec<u8>,
+    ) -> Option<pb::Data> {
+        scratch.clear();
+        scratch.extend_from_slice(encrypted);
+        self.cipher.apply_ctr(nonce, scratch);
+
+        let data = pb::Data::decode(scratch.as_slice()).ok()?;
+        let portnum = pb::PortNum::try_from(data.portnum).ok()?;
+        if portnum == pb::PortNum::UnknownApp {
             return None;
         }
-
-        let mut nonce = [0u8; 16];
-        nonce[..8].copy_from_slice(&u64::from(packet.id).to_le_bytes());
-        nonce[8..12].copy_from_slice(&packet.from.to_le_bytes());
-        let mut plaintext = encrypted.clone();
-        apply_ctr(&self.expanded_key, &nonce, &mut plaintext)?;
-
-        let data = pb::Data::decode(plaintext.as_slice()).ok()?;
-        let portnum = pb::PortNum::try_from(data.portnum).ok()?;
-        (portnum != pb::PortNum::UnknownApp).then_some(data)
+        // A wildcard key is tried against every packet with nothing but the
+        // decode above to tell right from wrong, and random bytes pass that
+        // surprisingly often (unknown fields are skipped silently). Require
+        // the plaintext to be exactly the canonical encoding of what was
+        // decoded: fields in order, nothing unknown, no trailing bytes.
+        // Named channels are already selected by channel hash or hint and
+        // keep the lenient check, so payloads from newer firmware that carry
+        // fields this build does not know still decode there.
+        if self.wildcard && data.encode_to_vec() != *scratch {
+            return None;
+        }
+        Some(data)
     }
 }
 
@@ -115,9 +183,22 @@ pub fn decrypt_packet(
     extra_channels: &[ExtraChannel],
     hint: Option<&str>,
 ) -> Option<(pb::Data, String)> {
+    let mesh_packet::PayloadVariant::Encrypted(encrypted) = packet.payload_variant.as_ref()? else {
+        return None;
+    };
+    if packet.pki_encrypted || encrypted.is_empty() || encrypted.starts_with(b"JRAW") {
+        return None;
+    }
+
+    // Meshtastic nonce: packet id (u64 LE), sender (u32 LE), zero block counter.
+    let mut nonce = [0u8; 16];
+    nonce[..8].copy_from_slice(&u64::from(packet.id).to_le_bytes());
+    nonce[8..12].copy_from_slice(&packet.from.to_le_bytes());
+
+    let mut scratch = Vec::with_capacity(encrypted.len());
     for channel in extra_channels {
         if channel.should_try(packet, hint) {
-            if let Some(data) = channel.decrypt(packet) {
+            if let Some(data) = channel.decrypt(&nonce, encrypted, &mut scratch) {
                 return Some((data, channel.label()));
             }
         }
@@ -178,19 +259,6 @@ fn wildcard_label(raw: &[u8]) -> String {
     }
 }
 
-fn apply_ctr(key: &[u8], nonce: &[u8; 16], bytes: &mut [u8]) -> Option<()> {
-    match key.len() {
-        16 => Ctr128BE::<Aes128>::new_from_slices(key, nonce)
-            .ok()?
-            .apply_keystream(bytes),
-        32 => Ctr128BE::<Aes256>::new_from_slices(key, nonce)
-            .ok()?
-            .apply_keystream(bytes),
-        _ => return None,
-    }
-    Some(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,6 +314,85 @@ mod tests {
         assert_eq!(data.portnum, pb::PortNum::TextMessageApp as i32);
         assert_eq!(data.payload, b"hi");
         assert_eq!(label, "*-0x01");
+    }
+
+    /// AES-CTR is symmetric, so "decrypting" a plaintext yields its ciphertext.
+    fn encrypt(channel: &ExtraChannel, id: u32, from: u32, plaintext: &[u8]) -> Vec<u8> {
+        let mut nonce = [0u8; 16];
+        nonce[..8].copy_from_slice(&u64::from(id).to_le_bytes());
+        nonce[8..12].copy_from_slice(&from.to_le_bytes());
+        let mut bytes = plaintext.to_vec();
+        channel.cipher.apply_ctr(&nonce, &mut bytes);
+        bytes
+    }
+
+    #[test]
+    fn decrypts_with_256_bit_keys_and_skips_pki_and_jraw() {
+        let key = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+        let channel = ExtraChannel::parse("*", &key).expect("channel");
+        let data = pb::Data {
+            portnum: pb::PortNum::PositionApp as i32,
+            payload: vec![1, 2, 3, 4, 5],
+            want_response: true,
+            request_id: 99,
+            bitfield: Some(1),
+            ..Default::default()
+        };
+        let ciphertext = encrypt(&channel, 10, 20, &data.encode_to_vec());
+        let mut packet = encrypted_packet(10, 20, 0, &ciphertext);
+        let channels = [channel];
+        let (decoded, _) = decrypt_packet(&packet, &channels, None).expect("decrypt");
+        assert_eq!(decoded, data);
+
+        // The wrong nonce (another sender) does not decrypt.
+        packet.from = 21;
+        assert!(decrypt_packet(&packet, &channels, None).is_none());
+        packet.from = 20;
+
+        packet.pki_encrypted = true;
+        assert!(decrypt_packet(&packet, &channels, None).is_none());
+        let jraw = encrypted_packet(1, 2, 0, b"JRAW\x01\x01\x01\x00\x01x");
+        assert!(decrypt_packet(&jraw, &channels, None).is_none());
+        assert!(decrypt_packet(&pb::MeshPacket::default(), &channels, None).is_none());
+    }
+
+    #[test]
+    fn wildcard_keys_reject_plaintext_that_is_not_canonical_data() {
+        let wildcard = ExtraChannel::parse("*", "AQ==").expect("channel");
+        let named = ExtraChannel::parse("Madrid", "AQ==").expect("channel");
+        let hash = u32::from(named.channel_hash());
+
+        // Each of these decodes as Data{TEXT_MESSAGE_APP, ..} with prost, but
+        // is not what an encoder would produce:
+        let garbage: [&[u8]; 4] = [
+            // unknown field 15 (varint) after the port number
+            &[0x08, 0x01, 0x78, 0x05],
+            // fields out of order: payload before portnum
+            &[0x12, 0x01, 0x41, 0x08, 0x01],
+            // portnum given twice
+            &[0x08, 0x03, 0x08, 0x01],
+            // explicit default value (want_response = false)
+            &[0x08, 0x01, 0x18, 0x00],
+        ];
+        for plaintext in garbage {
+            assert!(pb::Data::decode(plaintext).is_ok());
+            let ciphertext = encrypt(&wildcard, 5, 6, plaintext);
+            let packet = encrypted_packet(5, 6, hash, &ciphertext);
+            assert!(
+                decrypt_packet(&packet, std::slice::from_ref(&wildcard), None).is_none(),
+                "{plaintext:02x?}"
+            );
+            // A named channel matched by hash stays lenient.
+            assert!(decrypt_packet(&packet, std::slice::from_ref(&named), None).is_some());
+        }
+    }
+
+    #[test]
+    fn channels_compare_by_name_and_key() {
+        let a = ExtraChannel::parse("Madrid", "AQ==").expect("channel");
+        assert_eq!(a, a.clone());
+        assert_ne!(a, ExtraChannel::parse("Madrid", "Ag==").expect("channel"));
+        assert_ne!(a, ExtraChannel::parse("Toledo", "AQ==").expect("channel"));
     }
 
     #[test]

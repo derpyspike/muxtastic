@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use meshtastic::protobufs::{self as pb, from_radio, module_config};
+use meshtastic::protobufs::{self as pb, admin_message, from_radio, module_config};
 use meshtastic::Message;
 use muxtastic_core::mqtt::NodeMqttSnapshot;
 use muxtastic_core::provision::{self as core, mqtt_from_module_config, wants_proxy};
@@ -15,6 +15,9 @@ use crate::mqtt::MqttBridge;
 const QUERY_TIMEOUT: Duration = Duration::from_secs(8);
 const STEP_DELAY: Duration = Duration::from_millis(500);
 const METADATA_WAIT: Duration = Duration::from_secs(5);
+/// Attempts when the node does not answer the first config query at all.
+const CHECK_ATTEMPTS: u32 = 3;
+const CHECK_RETRY_DELAY: Duration = Duration::from_secs(10);
 
 struct ProvisionResult {
     checked: bool,
@@ -34,7 +37,19 @@ pub async fn run(state: Arc<AppState>, bridge: Arc<MqttBridge>) {
     }
 
     let has_net = wait_for_metadata(&state, METADATA_WAIT).await;
-    let result = ensure_mqtt_proxy(&state, node_num, has_net).await;
+    let mut result = ensure_mqtt_proxy(&state, node_num, has_net).await;
+    for attempt in 1..CHECK_ATTEMPTS {
+        if result.checked {
+            break;
+        }
+        warn!(
+            attempt,
+            reason = result.reason,
+            "node MQTT provisioning got no answer; retrying"
+        );
+        sleep(CHECK_RETRY_DELAY).await;
+        result = ensure_mqtt_proxy(&state, node_num, has_net).await;
+    }
     info!(
         checked = result.checked,
         changed = result.changed,
@@ -198,13 +213,8 @@ async fn query_mqtt_config(
                     let Ok(from_radio) = pb::FromRadio::decode(frame.as_ref()) else {
                         continue;
                     };
-                    let Some(from_radio::PayloadVariant::ModuleConfig(module)) =
-                        from_radio.payload_variant
-                    else {
-                        continue;
-                    };
-                    if let Some(mqtt) = mqtt_from_module_config(&module) {
-                        return Some(mqtt.clone());
+                    if let Some(mqtt) = mqtt_config_reply(&from_radio) {
+                        return Some(mqtt);
                     }
                 }
                 Err(RecvError::Lagged(skipped)) => {
@@ -224,10 +234,114 @@ async fn query_mqtt_config(
     }
 }
 
+/// Extract the MQTT module config from either reply form.
+///
+/// Firmware answers `get_module_config_request` with an `ADMIN_APP` packet
+/// carrying `get_module_config_response`; a config dump carries the same data
+/// as a bare `FromRadio.moduleConfig` frame. Accept both.
+fn mqtt_config_reply(from_radio: &pb::FromRadio) -> Option<module_config::MqttConfig> {
+    match from_radio.payload_variant.as_ref()? {
+        from_radio::PayloadVariant::ModuleConfig(module) => {
+            mqtt_from_module_config(module).cloned()
+        }
+        from_radio::PayloadVariant::Packet(packet) => {
+            let pb::mesh_packet::PayloadVariant::Decoded(data) = packet.payload_variant.as_ref()?
+            else {
+                return None;
+            };
+            if data.portnum != pb::PortNum::AdminApp as i32 {
+                return None;
+            }
+            let admin = pb::AdminMessage::decode(data.payload.as_slice()).ok()?;
+            match admin.payload_variant? {
+                admin_message::PayloadVariant::GetModuleConfigResponse(module) => {
+                    mqtt_from_module_config(&module).cloned()
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 async fn send_admin(state: &Arc<AppState>, to_radio: pb::ToRadio) -> bool {
     state.queue_to_node(to_radio.encode_to_vec())
 }
 
 fn packet_id() -> u32 {
     rand::random::<u32>().max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mqtt_module() -> pb::ModuleConfig {
+        pb::ModuleConfig {
+            payload_variant: Some(module_config::PayloadVariant::Mqtt(
+                module_config::MqttConfig {
+                    enabled: true,
+                    address: "broker".into(),
+                    ..Default::default()
+                },
+            )),
+        }
+    }
+
+    fn admin_packet(admin: pb::AdminMessage, portnum: pb::PortNum) -> pb::FromRadio {
+        pb::FromRadio {
+            id: 1,
+            payload_variant: Some(from_radio::PayloadVariant::Packet(pb::MeshPacket {
+                payload_variant: Some(pb::mesh_packet::PayloadVariant::Decoded(pb::Data {
+                    portnum: portnum as i32,
+                    payload: admin.encode_to_vec(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+        }
+    }
+
+    #[test]
+    fn accepts_a_bare_module_config_frame() {
+        let frame = pb::FromRadio {
+            id: 1,
+            payload_variant: Some(from_radio::PayloadVariant::ModuleConfig(mqtt_module())),
+        };
+        assert_eq!(
+            mqtt_config_reply(&frame).expect("mqtt config").address,
+            "broker"
+        );
+    }
+
+    #[test]
+    fn accepts_an_admin_response_packet() {
+        let admin = pb::AdminMessage {
+            payload_variant: Some(admin_message::PayloadVariant::GetModuleConfigResponse(
+                mqtt_module(),
+            )),
+            ..Default::default()
+        };
+        let reply = mqtt_config_reply(&admin_packet(admin.clone(), pb::PortNum::AdminApp));
+        assert!(reply.expect("mqtt config").enabled);
+        // The same bytes on another port are not an admin reply.
+        assert!(mqtt_config_reply(&admin_packet(admin, pb::PortNum::TextMessageApp)).is_none());
+    }
+
+    #[test]
+    fn ignores_other_module_configs_and_admin_messages() {
+        let frame = pb::FromRadio {
+            id: 1,
+            payload_variant: Some(from_radio::PayloadVariant::ModuleConfig(pb::ModuleConfig {
+                payload_variant: Some(module_config::PayloadVariant::Serial(Default::default())),
+            })),
+        };
+        assert!(mqtt_config_reply(&frame).is_none());
+
+        let admin = pb::AdminMessage {
+            payload_variant: Some(admin_message::PayloadVariant::GetModuleConfigRequest(0)),
+            ..Default::default()
+        };
+        assert!(mqtt_config_reply(&admin_packet(admin, pb::PortNum::AdminApp)).is_none());
+    }
 }

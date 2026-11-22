@@ -274,6 +274,16 @@ pub struct WebConfig {
     pub extra_channels: Vec<ExtraChannelConfig>,
     /// Append all 255 non-zero one-byte PSKs to the extra channel list.
     pub try_all_one_byte_keys: bool,
+    /// MeshCore channels to decrypt besides Public: `#hashtag` names need no
+    /// key, private channels need their 16- or 32-byte key (base64 or hex).
+    pub meshcore_channels: Vec<ExtraChannelConfig>,
+    /// MeshCore region names tried against region-scoped packets.
+    pub meshcore_regions: Vec<String>,
+    /// Map tile URL template; the browser fetches tiles from it directly.
+    /// Empty disables the background map.
+    pub map_tile_url: String,
+    /// Attribution shown on the map for the tile source.
+    pub map_attribution: String,
 }
 
 impl Default for WebConfig {
@@ -288,6 +298,10 @@ impl Default for WebConfig {
             mqtt: WebMqttConfig::default(),
             extra_channels: Vec::new(),
             try_all_one_byte_keys: false,
+            meshcore_channels: Vec::new(),
+            meshcore_regions: Vec::new(),
+            map_tile_url: "https://tile.openstreetmap.org/{z}/{x}/{y}.png".into(),
+            map_attribution: "© OpenStreetMap contributors".into(),
         }
     }
 }

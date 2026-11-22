@@ -4,8 +4,11 @@
 //! client may send to the radio and what the radio may send to clients. The
 //! rules mirror the original `message_router.py`, including the quirks:
 //!
-//! * `ADMIN_APP` is allowed from loopback, an allowlist, or when a client
-//!   addresses the packet to itself (`from == to`).
+//! * `ADMIN_APP` is allowed from loopback or an allowlisted address only. The
+//!   original `from == to` shortcut is gone: both fields are client-controlled,
+//!   so it let any client bypass the allowlist.
+//! * Packets that arrive already encrypted cannot be inspected, so they are
+//!   blocked; apps send decoded payloads and let the node encrypt.
 //! * `removeByNodenum` is answered with a fabricated routing ACK so the app's
 //!   delete gesture does not hang; the real command is never forwarded.
 //! * `addContact` is blocked from every client, including loopback.
@@ -48,8 +51,10 @@ impl Cidr {
         Some(Self { addr, prefix })
     }
 
+    /// IPv4-mapped IPv6 peers (`::ffff:a.b.c.d`, seen on dual-stack listeners)
+    /// are compared as IPv4.
     pub fn contains(&self, ip: IpAddr) -> bool {
-        match (self.addr, ip) {
+        match (self.addr.to_canonical(), ip.to_canonical()) {
             (IpAddr::V4(net), IpAddr::V4(ip)) => {
                 let mask = v4_mask(self.prefix);
                 (u32::from(net) & mask) == (u32::from(ip) & mask)
@@ -175,13 +180,27 @@ fn route_packet(
 ) -> ClientRoute {
     let portnum = match &packet.payload_variant {
         Some(pb::mesh_packet::PayloadVariant::Decoded(data)) => Some(data.portnum),
-        _ => None,
+        // Ciphertext hides the port number, so the admin gate and
+        // `blocked_portnums` could not be applied. Clients hold the channel
+        // keys (they are in the replay), so forwarding it would let them
+        // bypass every rule below.
+        //
+        // Nexus JRAW tunnel chunks are the exception: they carry MeshCore or
+        // Reticulum frames, not a Meshtastic `Data`, so there is no port
+        // number to hide.
+        Some(pb::mesh_packet::PayloadVariant::Encrypted(bytes)) => {
+            if crate::raw_tunnel::parse_chunk(bytes).is_none() {
+                return ClientRoute::blocked();
+            }
+            None
+        }
+        None => None,
     };
 
     let mut resync = false;
 
     if portnum == Some(pb::PortNum::AdminApp as i32) {
-        if !admin_allowed(packet, ctx) {
+        if !admin_allowed(ctx) {
             return ClientRoute::blocked();
         }
 
@@ -230,16 +249,15 @@ fn route_packet(
     }
 }
 
-fn admin_allowed(packet: &pb::MeshPacket, ctx: &ClientContext<'_>) -> bool {
-    if packet.from != 0 && packet.from == packet.to {
+fn admin_allowed(ctx: &ClientContext<'_>) -> bool {
+    // `from`/`to` are chosen by the client and prove nothing; only the peer
+    // address counts. Dual-stack listeners report IPv4 peers as
+    // `::ffff:a.b.c.d`, so compare the canonical form.
+    let ip = ctx.ip.to_canonical();
+    if ip.is_loopback() {
         return true;
     }
-    if ctx.ip.is_loopback() {
-        return true;
-    }
-    ctx.allow_admin_from
-        .iter()
-        .any(|cidr| cidr.contains(ctx.ip))
+    ctx.allow_admin_from.iter().any(|cidr| cidr.contains(ip))
 }
 
 fn is_settings_write(variant: &admin_message::PayloadVariant) -> bool {
@@ -407,7 +425,7 @@ mod tests {
     }
 
     #[test]
-    fn admin_is_allowed_from_loopback_and_self_addressed() {
+    fn admin_is_allowed_from_loopback_but_not_when_self_addressed() {
         let admin = pb::AdminMessage {
             payload_variant: Some(admin_message::PayloadVariant::SetOwner(Default::default())),
             ..Default::default()
@@ -432,6 +450,7 @@ mod tests {
         assert!(matches!(route.action, ClientAction::Forward(_)));
         assert!(route.resync);
 
+        // from == to is client-controlled and must not bypass the gate.
         let (ip, allow) = ctx("203.0.113.9", &[]);
         let route = route_from_client(
             &to_radio.encode_to_vec(),
@@ -442,7 +461,81 @@ mod tests {
                 blocked_portnums: &[],
             },
         );
+        assert_eq!(route.action, ClientAction::Blocked);
+
+        // The same packet from an allowlisted address is forwarded.
+        let allow = [Cidr::parse("203.0.113.0/24").unwrap()];
+        let route = route_from_client(
+            &to_radio.encode_to_vec(),
+            &ClientContext {
+                ip,
+                node_num: 7,
+                allow_admin_from: &allow,
+                blocked_portnums: &[],
+            },
+        );
         assert!(matches!(route.action, ClientAction::Forward(_)));
+    }
+
+    #[test]
+    fn ipv4_mapped_peers_match_loopback_and_v4_cidrs() {
+        let to_radio = admin_packet(pb::AdminMessage {
+            payload_variant: Some(admin_message::PayloadVariant::SetOwner(Default::default())),
+            ..Default::default()
+        })
+        .encode_to_vec();
+        let route = |ip: &str, allow: &[Cidr]| {
+            route_from_client(
+                &to_radio,
+                &ClientContext {
+                    ip: ip.parse().unwrap(),
+                    node_num: 7,
+                    allow_admin_from: allow,
+                    blocked_portnums: &[],
+                },
+            )
+            .action
+        };
+
+        assert!(matches!(
+            route("::ffff:127.0.0.1", &[]),
+            ClientAction::Forward(_)
+        ));
+        assert!(matches!(route("::1", &[]), ClientAction::Forward(_)));
+        assert_eq!(route("::ffff:192.168.1.5", &[]), ClientAction::Blocked);
+
+        let allow = [Cidr::parse("192.168.1.0/24").unwrap()];
+        assert!(matches!(
+            route("::ffff:192.168.1.5", &allow),
+            ClientAction::Forward(_)
+        ));
+        assert_eq!(route("::ffff:192.168.2.5", &allow), ClientAction::Blocked);
+        assert!(allow[0].contains("::ffff:192.168.1.9".parse().unwrap()));
+    }
+
+    #[test]
+    fn encrypted_client_packets_are_blocked() {
+        let packet = pb::MeshPacket {
+            from: 7,
+            to: 0xFFFF_FFFF,
+            payload_variant: Some(pb::mesh_packet::PayloadVariant::Encrypted(vec![1, 2, 3])),
+            ..Default::default()
+        };
+        let to_radio = pb::ToRadio {
+            payload_variant: Some(to_radio::PayloadVariant::Packet(packet)),
+        };
+        // Even loopback: the payload cannot be checked against any rule.
+        let (ip, allow) = ctx("127.0.0.1", &[]);
+        let route = route_from_client(
+            &to_radio.encode_to_vec(),
+            &ClientContext {
+                ip,
+                node_num: 7,
+                allow_admin_from: &allow,
+                blocked_portnums: &[],
+            },
+        );
+        assert_eq!(route.action, ClientAction::Blocked);
     }
 
     #[test]
@@ -541,7 +634,11 @@ mod tests {
             from: 0,
             pki_encrypted: true,
             public_key: vec![1, 2, 3],
-            payload_variant: Some(pb::mesh_packet::PayloadVariant::Encrypted(vec![9])),
+            payload_variant: Some(pb::mesh_packet::PayloadVariant::Decoded(pb::Data {
+                portnum: pb::PortNum::TextMessageApp as i32,
+                payload: b"dm".to_vec(),
+                ..Default::default()
+            })),
             ..Default::default()
         };
         let to_radio = pb::ToRadio {

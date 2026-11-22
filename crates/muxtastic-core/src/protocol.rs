@@ -32,8 +32,10 @@ pub fn encode_frame(payload: &[u8]) -> Result<Vec<u8>, FrameError> {
 ///
 /// Feed arbitrary chunks with [`FrameDecoder::push`] and drain complete
 /// payloads with [`FrameDecoder::next_frame`]. It tolerates leading garbage,
-/// frames split across reads, and oversized frames (which are skipped so the
-/// stream can resync).
+/// frames split across reads, and headers with an oversized length. Such a
+/// header is treated as a false sync: only the 4 header bytes are dropped and
+/// the search restarts right after them, like the firmware's stream parser.
+/// The result therefore never depends on how the bytes were split into reads.
 #[derive(Debug, Default, Clone)]
 pub struct FrameDecoder {
     buf: Vec<u8>,
@@ -81,14 +83,10 @@ impl FrameDecoder {
             let payload_len = u16::from_be_bytes([self.buf[2], self.buf[3]]) as usize;
 
             if payload_len > MAX_PACKET_SIZE {
-                // Oversized: skip the whole frame when buffered, otherwise
-                // drop the header and resync from the remainder.
-                let frame_len = 4 + payload_len;
-                if self.buf.len() >= frame_len {
-                    self.buf.drain(..frame_len);
-                } else {
-                    self.buf.drain(..4);
-                }
+                // No peer sends more than 512 bytes, so this is corruption or
+                // a false sync. Trusting the bogus length would swallow up to
+                // 64 KiB of good frames; drop just the header and resync.
+                self.buf.drain(..4);
                 continue;
             }
 
@@ -180,6 +178,33 @@ mod tests {
         decoder.push(&vec![0xAA; 0x201]);
         decoder.push(&encode_frame(b"ok").unwrap());
         assert_eq!(decoder.next_frame().as_deref(), Some(b"ok".as_slice()));
+    }
+
+    #[test]
+    fn oversized_resync_does_not_depend_on_read_chunking() {
+        // A bogus oversized header directly followed by a good frame, then
+        // filler and another good frame.
+        let mut stream = vec![START1, START2, 0x02, 0x01];
+        stream.extend_from_slice(&encode_frame(b"first").unwrap());
+        stream.extend_from_slice(&[0x55; 600]);
+        stream.extend_from_slice(&encode_frame(b"second").unwrap());
+
+        let decode = |chunk: usize| {
+            let mut decoder = FrameDecoder::new();
+            let mut frames = Vec::new();
+            for part in stream.chunks(chunk) {
+                decoder.push(part);
+                while let Some(frame) = decoder.next_frame() {
+                    frames.push(frame);
+                }
+            }
+            frames
+        };
+
+        let expected = vec![b"first".to_vec(), b"second".to_vec()];
+        for chunk in [1, 2, 3, 5, 64, 517, stream.len()] {
+            assert_eq!(decode(chunk), expected, "chunk size {chunk}");
+        }
     }
 
     #[test]

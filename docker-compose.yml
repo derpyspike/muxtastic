@@ -1,6 +1,13 @@
 services:
   muxtastic:
     build: .
+    # The image runs as an unprivileged user with UID/GID 1000. If your host
+    # user has a different id, either build with matching ids:
+    #   build:
+    #     context: .
+    #     args: { MUX_UID: "1001", MUX_GID: "1001" }
+    # or run as your own user:
+    #   user: "1001:1001"
     container_name: muxtastic
     restart: unless-stopped
     # Host networking is required for mDNS multicast and for reaching a
@@ -8,13 +15,23 @@ services:
     network_mode: host
     volumes:
       - ./configs/config.yaml:/app/configs/config.yaml:ro
+      # Create these as your own user BEFORE the first start (mkdir -p logs data).
+      # If Docker creates them, they belong to root and the container cannot
+      # write the database or the log files.
       - ./logs:/app/logs
       - ./data:/app/data
     devices:
       # Uncomment for a USB-connected node:
       # - "/dev/ttyUSB0:/dev/ttyUSB0"
+    # The container user is in the image's `dialout` group (GID 20). If the
+    # device belongs to another group on the host, add that numeric GID here
+    # (find it with: stat -c %g /dev/ttyUSB0):
+    # group_add:
+    #   - "986"
     environment:
       - TZ=UTC
+      # Port the healthcheck looks for; set it when server.port is not 4404.
+      # - MUXTASHTIC_HEALTH_PORT=4404
     logging:
       driver: "json-file"
       options:

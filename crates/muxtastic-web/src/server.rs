@@ -1,11 +1,13 @@
 //! Axum web server and JSON API for the Muxtastic UI.
 
+use std::collections::hash_map::DefaultHasher;
 use std::fmt::Display;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
-use axum::http::{header, StatusCode};
-use axum::response::{Html, IntoResponse, Response};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use muxtastic_core::config::WebConfig;
@@ -16,8 +18,8 @@ use tokio::sync::watch;
 use tracing::info;
 
 use crate::db::{
-    Database, DirectNode, JrawNode, Message, MqttGateway, Node, NodeName, PacketFilter,
-    PacketFilterOptions, PacketListEntry, PacketRow, RawFrame, Reception, RelaySample, RelayStats,
+    Database, DirectNode, JrawNode, JrawStats, Message, MqttGateway, Node, NodeName, PacketFilter,
+    PacketFilterOptions, PacketListEntry, PacketRow, RawFilter, RawFilterOptions, RawFrame, Reception, RelaySample, RelayStats,
     Stats, Traceroute,
 };
 
@@ -88,6 +90,45 @@ pub type StatusFn = Arc<dyn Fn() -> StatusSnapshot + Send + Sync>;
 struct WebState {
     db: Arc<Database>,
     status: StatusFn,
+    ui: Arc<UiConfig>,
+}
+
+/// Settings the page needs; never contains keys.
+#[derive(Debug, Clone, Serialize)]
+struct UiConfig {
+    map_tile_url: String,
+    map_attribution: String,
+    meshcore_channels: Vec<UiChannel>,
+    meshcore_regions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UiChannel {
+    name: String,
+    hash: u8,
+}
+
+impl UiConfig {
+    fn new(config: &WebConfig, db: &Database) -> Self {
+        let keys = db.meshcore_keys();
+        Self {
+            map_tile_url: config.map_tile_url.trim().to_owned(),
+            map_attribution: config.map_attribution.trim().to_owned(),
+            meshcore_channels: keys
+                .channels()
+                .iter()
+                .map(|channel| UiChannel {
+                    name: channel.name.clone(),
+                    hash: channel.hash,
+                })
+                .collect(),
+            meshcore_regions: keys
+                .regions()
+                .iter()
+                .map(|region| region.name.clone())
+                .collect(),
+        }
+    }
 }
 
 type ApiError = (StatusCode, String);
@@ -102,7 +143,8 @@ pub async fn serve(
     let address = listener.local_addr()?;
     info!(%address, database = %config.database, "web UI listening");
 
-    axum::serve(listener, router(WebState { db, status }))
+    let ui = Arc::new(UiConfig::new(&config, &db));
+    axum::serve(listener, router(WebState { db, status, ui }))
         .with_graceful_shutdown(wait_for_shutdown(shutdown))
         .await?;
     info!("web UI stopped");
@@ -114,6 +156,9 @@ fn router(state: WebState) -> Router {
         .route("/", get(index))
         .route("/static/style.css", get(style))
         .route("/static/app.js", get(script))
+        .route("/static/leaflet.js", get(leaflet_script))
+        .route("/static/leaflet.css", get(leaflet_style))
+        .route("/api/config", get(api_config))
         .route("/api/stats", get(api_stats))
         .route("/api/status", get(api_status))
         .route("/api/messages", get(api_messages))
@@ -122,6 +167,7 @@ fn router(state: WebState) -> Router {
         .route("/api/nodes/{num}", get(api_node))
         .route("/node/{num}", get(node_page))
         .route("/api/raw", get(api_raw))
+        .route("/api/raw-filters", get(api_raw_filters))
         .route("/api/channels", get(api_channels))
         .route("/api/receptions", get(api_receptions))
         .route("/api/traceroutes", get(api_traceroutes))
@@ -130,36 +176,108 @@ fn router(state: WebState) -> Router {
         .route("/api/packets", get(api_packets))
         .route("/api/packet-filters", get(api_packet_filters))
         .route("/api/jraw-nodes", get(api_jraw_nodes))
+        .route("/api/jraw-stats", get(api_jraw_stats))
         .route("/api/relay-stats", get(api_relay_stats))
         .route("/api/relay-series", get(api_relay_series))
         .with_state(state)
 }
 
-async fn index() -> Html<&'static str> {
-    Html(include_str!("static/index.html"))
+async fn index(headers: HeaderMap) -> Response {
+    static_asset(
+        &headers,
+        "text/html; charset=utf-8",
+        include_str!("static/index.html"),
+    )
 }
 
-async fn node_page() -> Html<&'static str> {
-    Html(include_str!("static/index.html"))
+async fn node_page(headers: HeaderMap) -> Response {
+    static_asset(
+        &headers,
+        "text/html; charset=utf-8",
+        include_str!("static/index.html"),
+    )
 }
 
-async fn style() -> Response {
-    (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+async fn style(headers: HeaderMap) -> Response {
+    static_asset(
+        &headers,
+        "text/css; charset=utf-8",
         include_str!("static/style.css"),
     )
-        .into_response()
 }
 
-async fn script() -> Response {
-    (
-        [(
-            header::CONTENT_TYPE,
-            "application/javascript; charset=utf-8",
-        )],
+async fn script(headers: HeaderMap) -> Response {
+    static_asset(
+        &headers,
+        "application/javascript; charset=utf-8",
         include_str!("static/app.js"),
     )
-        .into_response()
+}
+
+/// Leaflet 1.9.4 (BSD-2-Clause), vendored so the map needs no third-party script.
+async fn leaflet_script(headers: HeaderMap) -> Response {
+    static_asset(
+        &headers,
+        "application/javascript; charset=utf-8",
+        include_str!("static/leaflet.js"),
+    )
+}
+
+async fn leaflet_style(headers: HeaderMap) -> Response {
+    static_asset(
+        &headers,
+        "text/css; charset=utf-8",
+        include_str!("static/leaflet.css"),
+    )
+}
+
+/// Serve an embedded file with an ETag so browsers revalidate with a cheap
+/// `304 Not Modified` instead of downloading it again, and still pick up a
+/// new build immediately.
+fn static_asset(headers: &HeaderMap, content_type: &'static str, body: &'static str) -> Response {
+    let tag = etag(body);
+    let cached = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.split(',').any(|candidate| candidate.trim() == tag));
+    let caching = [
+        (header::ETAG, tag),
+        (header::CACHE_CONTROL, "no-cache".to_owned()),
+    ];
+    if cached {
+        return (StatusCode::NOT_MODIFIED, caching).into_response();
+    }
+    (caching, [(header::CONTENT_TYPE, content_type)], body).into_response()
+}
+
+fn etag(body: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    body.hash(&mut hasher);
+    format!("\"{:016x}\"", hasher.finish())
+}
+
+#[derive(Deserialize)]
+struct JrawStatsQuery {
+    kind: Option<i64>,
+}
+
+async fn api_jraw_stats(
+    State(state): State<WebState>,
+    Query(query): Query<JrawStatsQuery>,
+) -> Result<Json<JrawStats>, ApiError> {
+    let kind = query.kind.unwrap_or(1);
+    if kind != 1 && kind != 2 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "kind must be 1 (MeshCore) or 2 (Reticulum)".to_owned(),
+        ));
+    }
+    let stats = blocking(state.db.clone(), move |db| db.query_jraw_stats(kind)).await?;
+    Ok(Json(stats))
+}
+
+async fn api_config(State(state): State<WebState>) -> Json<UiConfig> {
+    Json(state.ui.as_ref().clone())
 }
 
 #[derive(Serialize)]
@@ -230,6 +348,26 @@ async fn api_node(
 struct RawQuery {
     kind: Option<i64>,
     limit: Option<usize>,
+    payload: Option<i64>,
+    route: Option<i64>,
+    channel: Option<i64>,
+    decrypted: Option<bool>,
+    region: Option<String>,
+    q: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawFiltersQuery {
+    kind: Option<i64>,
+}
+
+async fn api_raw_filters(
+    State(state): State<WebState>,
+    Query(query): Query<RawFiltersQuery>,
+) -> Result<Json<RawFilterOptions>, ApiError> {
+    let kind = query.kind.unwrap_or(1);
+    let options = blocking(state.db.clone(), move |db| db.query_raw_filters(kind)).await?;
+    Ok(Json(options))
 }
 
 async fn api_raw(
@@ -237,8 +375,17 @@ async fn api_raw(
     Query(query): Query<RawQuery>,
 ) -> Result<Json<Vec<RawFrame>>, ApiError> {
     let limit = query.limit.unwrap_or(200);
+    let filter = RawFilter {
+        kind: query.kind,
+        payload_type: query.payload,
+        route_type: query.route,
+        channel_hash: query.channel,
+        decrypted: query.decrypted,
+        region: query.region,
+        search: query.q,
+    };
     let frames = blocking(state.db.clone(), move |db| {
-        db.query_raw_frames(query.kind, limit)
+        db.query_raw_frames_filtered(&filter, limit)
     })
     .await?;
     Ok(Json(frames))

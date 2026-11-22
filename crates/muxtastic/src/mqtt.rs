@@ -8,11 +8,13 @@ use muxtastic_core::config::{MqttBridgeConfig, SecondaryMqttConfig};
 use muxtastic_core::mqtt::{
     self, broker2_active as compute_broker2_active, client_id, is_lora_transport, is_own_envelope,
     is_valid_downlink_topic, matches_raw_scope, observed_region, raw_topic, resolve_region,
-    standard_mirror_active, standard_topic, topic_for_proxy, NodeMqttSnapshot, RecentIds,
-    RecentPublishes, MAX_PAYLOAD,
+    standard_mirror_active, standard_topic, NodeMqttSnapshot, RecentIds, RecentPublishes,
+    MAX_PAYLOAD,
 };
 use muxtastic_core::raw_tunnel::{feed_topic, RawTunnelFrame, RawTunnelKind};
-use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, TlsConfiguration, Transport};
+use rumqttc::{
+    AsyncClient, Event, MqttOptions, Packet, QoS, SubscribeReasonCode, TlsConfiguration, Transport,
+};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -21,9 +23,22 @@ use crate::app::AppState;
 
 const ECHO_WINDOW_MS: u64 = 30_000;
 const ID_WINDOW_MS: u64 = 60_000;
+/// Broker traffic remembered so a proxying client cannot feed it back to us.
+const BROKER_SEEN_CAPACITY: usize = 4_096;
 const STATS_INTERVAL: Duration = Duration::from_secs(300);
 
-type DownlinkCallback = Arc<dyn Fn(String, Vec<u8>, bool) + Send + Sync>;
+/// A session must survive this long before the reconnect backoff resets, so a
+/// broker that accepts and then drops us cannot cause a 1 s reconnect loop.
+const STABLE_SESSION: Duration = Duration::from_secs(30);
+/// Inbound MQTT packet limit. rumqttc cannot skip an oversize packet: it ends
+/// the session. The bridge subscribes to wildcards, so allow far more than the
+/// 512-byte mesh payload before giving up on the connection.
+const MAX_INCOMING_PACKET: usize = 1024 * 1024;
+const MAX_OUTGOING_PACKET: usize = 10 * 1024;
+/// Request queue between the bridge and the rumqttc event loop.
+const REQUEST_CAPACITY: usize = 64;
+
+type DownlinkCallback = Arc<dyn Fn(&str, &[u8], bool) + Send + Sync>;
 
 struct MqttEndpoint {
     host: String,
@@ -170,7 +185,10 @@ impl MqttLeg {
                 options.set_transport(Transport::tls_with_config(TlsConfiguration::default()));
             }
 
-            let (client, mut eventloop) = AsyncClient::new(options, 10);
+            options.set_max_packet_size(MAX_INCOMING_PACKET, MAX_OUTGOING_PACKET);
+
+            let (client, mut eventloop) = AsyncClient::new(options, REQUEST_CAPACITY);
+            let mut connected_at: Option<Instant> = None;
             *self
                 .client
                 .lock()
@@ -196,23 +214,38 @@ impl MqttLeg {
                         match event {
                             Ok(Event::Incoming(Packet::ConnAck(_))) => {
                                 self.connected.store(true, Ordering::SeqCst);
-                                backoff = 1;
+                                connected_at = Some(Instant::now());
                                 info!(leg = self.name, "MQTT connected");
+                                // Never await the request queue from the task
+                                // that drains it.
                                 for topic in &self.subscribe_topics {
                                     if let Err(error) =
-                                        client.subscribe(topic.as_str(), QoS::AtMostOnce).await
+                                        client.try_subscribe(topic.as_str(), QoS::AtMostOnce)
                                     {
                                         warn!(leg = self.name, topic, %error, "MQTT subscribe failed");
                                     }
                                 }
                             }
+                            Ok(Event::Incoming(Packet::SubAck(suback))) => {
+                                let rejected = suback
+                                    .return_codes
+                                    .iter()
+                                    .filter(|code| matches!(code, SubscribeReasonCode::Failure))
+                                    .count();
+                                if rejected > 0 {
+                                    warn!(
+                                        leg = self.name,
+                                        rejected,
+                                        topics = ?self.subscribe_topics,
+                                        "MQTT broker rejected a subscription; downlink and the loop guard will not see broker traffic"
+                                    );
+                                } else {
+                                    debug!(leg = self.name, "MQTT subscription acknowledged");
+                                }
+                            }
                             Ok(Event::Incoming(Packet::Publish(publish))) => {
                                 if let Some(callback) = &downlink {
-                                    callback(
-                                        publish.topic,
-                                        publish.payload.to_vec(),
-                                        publish.retain,
-                                    );
+                                    callback(&publish.topic, &publish.payload, publish.retain);
                                 }
                             }
                             Ok(_) => {}
@@ -233,6 +266,10 @@ impl MqttLeg {
 
             if *shutdown.borrow() {
                 break;
+            }
+
+            if connected_at.is_some_and(|since| since.elapsed() >= STABLE_SESSION) {
+                backoff = 1;
             }
 
             info!(leg = self.name, seconds = backoff, "MQTT reconnecting");
@@ -260,7 +297,6 @@ impl MqttLeg {
 pub struct MqttBridge {
     state: Arc<AppState>,
     config: MqttBridgeConfig,
-    node_num: u32,
     primary: Arc<MqttLeg>,
     secondary: Option<Arc<MqttLeg>>,
     broker2_active: bool,
@@ -269,7 +305,8 @@ pub struct MqttBridge {
     gateway_ids: StdMutex<RecentIds>,
     proxy_ids: StdMutex<RecentIds>,
     recent_publishes: StdMutex<RecentPublishes>,
-    last_channel: StdMutex<Option<u32>>,
+    /// Messages recently delivered by the broker (topic + payload hash).
+    broker_seen: StdMutex<RecentPublishes>,
     ok_to_mqtt_missing_logged: AtomicBool,
     gateway_published: AtomicU64,
     standard_mirrored: AtomicU64,
@@ -279,13 +316,17 @@ pub struct MqttBridge {
     dropped_downlink_disabled: AtomicU64,
     loop_guard_drops: AtomicU64,
     echo_suppressed: AtomicU64,
+    proxy_loop_drops: AtomicU64,
     retained_skipped: AtomicU64,
     started: Instant,
     tasks: StdMutex<Vec<JoinHandle<()>>>,
 }
 
 impl MqttBridge {
-    pub fn new(state: Arc<AppState>, node_num: u32) -> Self {
+    /// Build the bridge. Call this once the node number is known: it is baked
+    /// into the MQTT client id. Everything else reads the number live.
+    pub fn new(state: Arc<AppState>) -> Self {
+        let node_num = state.node_num();
         let config = state.config.mqtt_bridge.clone();
         let secondary_config = config.broker2.as_ref();
         let broker2_active = compute_broker2_active(&config, secondary_config);
@@ -325,7 +366,6 @@ impl MqttBridge {
         Self {
             state,
             config,
-            node_num,
             primary,
             secondary,
             broker2_active,
@@ -334,7 +374,7 @@ impl MqttBridge {
             gateway_ids: StdMutex::new(RecentIds::new(ID_WINDOW_MS, 500)),
             proxy_ids: StdMutex::new(RecentIds::new(ID_WINDOW_MS, 500)),
             recent_publishes: StdMutex::new(RecentPublishes::new(ECHO_WINDOW_MS, 200)),
-            last_channel: StdMutex::new(None),
+            broker_seen: StdMutex::new(RecentPublishes::new(ECHO_WINDOW_MS, BROKER_SEEN_CAPACITY)),
             ok_to_mqtt_missing_logged: AtomicBool::new(false),
             gateway_published: AtomicU64::new(0),
             standard_mirrored: AtomicU64::new(0),
@@ -344,6 +384,7 @@ impl MqttBridge {
             dropped_downlink_disabled: AtomicU64::new(0),
             loop_guard_drops: AtomicU64::new(0),
             echo_suppressed: AtomicU64::new(0),
+            proxy_loop_drops: AtomicU64::new(0),
             retained_skipped: AtomicU64::new(0),
             started: Instant::now(),
             tasks: StdMutex::new(Vec::new()),
@@ -355,7 +396,7 @@ impl MqttBridge {
 
         let downlink: DownlinkCallback = {
             let bridge = Arc::clone(self);
-            Arc::new(move |topic, payload, retained| {
+            Arc::new(move |topic: &str, payload: &[u8], retained: bool| {
                 bridge.handle_downlink(topic, payload, retained);
             })
         };
@@ -420,11 +461,9 @@ impl MqttBridge {
             .unwrap_or_else(|error| error.into_inner()) = snapshot;
     }
 
-    pub fn mark_channel(&self, index: i32) {
-        *self
-            .last_channel
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = Some(index as u32);
+    /// The physical node's number, read live. Zero until the node has synced.
+    fn node_num(&self) -> u32 {
+        self.state.node_num()
     }
 
     fn now_ms(&self) -> u64 {
@@ -466,7 +505,14 @@ impl MqttBridge {
         )
     }
 
-    fn note_proxy_published(&self, id: u32) {
+    /// Record the packet id carried by a proxy frame from the physical node.
+    ///
+    /// Synchronous on purpose: call it before spawning any publish task so the
+    /// raw gateway and standard mirror see the id as proxy-covered.
+    pub fn note_proxy_envelope(&self, payload: &[u8]) {
+        let Some(id) = mqtt::envelope_packet_id(payload).filter(|id| *id != 0) else {
+            return;
+        };
         let now = self.now_ms();
         self.proxy_ids
             .lock()
@@ -506,15 +552,31 @@ impl MqttBridge {
             .is_recent(topic, payload, now)
     }
 
-    fn check_uplink_allowed(&self) -> bool {
+    fn remember_broker_message(&self, topic: &str, payload: &[u8]) {
+        let now = self.now_ms();
+        self.broker_seen
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remember(topic, payload, now);
+    }
+
+    fn is_broker_message(&self, topic: &str, payload: &[u8]) -> bool {
+        let now = self.now_ms();
+        self.broker_seen
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_recent(topic, payload, now)
+    }
+
+    /// Honour the `uplink_enabled` flag of the channel this message belongs to.
+    ///
+    /// The channel comes from the envelope's `channel_id`, or from the topic
+    /// (`{root}/{region}/2/e/{channel}/...`). An unknown channel is allowed.
+    fn check_uplink_allowed(&self, topic: &str, payload: &[u8]) -> bool {
         if self.config.ignore_ok_to_mqtt {
             return true;
         }
-        let Some(index) = *self
-            .last_channel
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-        else {
+        let Some(channel) = proxy_channel_name(topic, payload) else {
             return true;
         };
         let allowed = {
@@ -523,12 +585,15 @@ impl MqttBridge {
                 .cache
                 .read()
                 .unwrap_or_else(|error| error.into_inner());
-            mqtt::channel_uplink(&cache, index)
+            channel_uplink_by_name(&cache.channels, &channel)
         };
         match allowed {
             Some(allowed) => {
                 if !allowed && !self.ok_to_mqtt_missing_logged.swap(true, Ordering::Relaxed) {
-                    warn!("channel uplink_enabled=false; set ignore_ok_to_mqtt=true to bypass");
+                    warn!(
+                        %channel,
+                        "channel uplink_enabled=false; set ignore_ok_to_mqtt=true to bypass"
+                    );
                 }
                 allowed
             }
@@ -562,13 +627,18 @@ impl MqttBridge {
             debug!("MQTT uplink disabled; dropped proxy message");
             return false;
         }
-        if !self.config.ignore_ok_to_mqtt && !self.check_uplink_allowed() {
+        if self.node_num() == 0 {
             self.dropped_uplink.fetch_add(1, Ordering::Relaxed);
-            debug!("channel uplink flag blocked the proxy publish");
+            debug!("node number not known yet; dropped proxy message");
             return false;
         }
 
-        let topic = topic_for_proxy(&self.config.root_topic, &topic);
+        let topic = proxy_topic_under_root(&self.config.root_topic, &topic);
+        if !self.check_uplink_allowed(&topic, &payload) {
+            self.dropped_uplink.fetch_add(1, Ordering::Relaxed);
+            debug!(%topic, "channel uplink flag blocked the proxy publish");
+            return false;
+        }
         self.observe_region(&topic);
         if payload.len() > MAX_PAYLOAD {
             warn!(
@@ -577,31 +647,35 @@ impl MqttBridge {
             );
             return false;
         }
+        // Loop guard: a client (or node) acting as an MQTT proxy forwards broker
+        // traffic to us as proxy messages. Republishing a message that the
+        // broker just delivered, or that we just published, would circulate it
+        // forever.
+        if self.is_recent_echo(&topic, &payload) || self.is_broker_message(&topic, &payload) {
+            let dropped = self.proxy_loop_drops.fetch_add(1, Ordering::Relaxed) + 1;
+            if dropped == 1 || dropped.is_multiple_of(10_000) {
+                warn!(
+                    %topic,
+                    dropped,
+                    "proxy message is already on the broker; not republishing (MQTT loop guard)"
+                );
+            }
+            return false;
+        }
         if !self.primary.is_connected() {
             self.dropped_uplink.fetch_add(1, Ordering::Relaxed);
             debug!("MQTT primary not connected; dropping proxy publish");
             return false;
         }
+        // Remember before the publish so a copy racing back through a proxying
+        // client is already recognised.
+        self.remember_publish(&topic, &payload);
         if !self.primary.publish(&topic, &payload, retain).await {
             return false;
         }
 
-        self.remember_publish(&topic, &payload);
         let _ = self.publish_secondary(&topic, &payload).await;
         true
-    }
-
-    /// A proxy frame arrived from the physical node.
-    pub async fn publish_from_physical_proxy(
-        &self,
-        topic: String,
-        payload: Vec<u8>,
-        retained: bool,
-    ) -> bool {
-        if let Some(id) = mqtt::envelope_packet_id(&payload).filter(|id| *id != 0) {
-            self.note_proxy_published(id);
-        }
-        self.publish_proxy(topic, payload, retained).await
     }
 
     /// Raw gateway: publish one LoRa packet to `raw/{region}/!{sender}`.
@@ -637,7 +711,12 @@ impl MqttBridge {
             return false;
         }
 
-        let payload = mqtt::build_envelope(packet, self.node_num);
+        let node_num = self.node_num();
+        if node_num == 0 {
+            debug!("MQTT gateway skipped: node number not known yet");
+            return false;
+        }
+        let payload = mqtt::build_envelope(packet, node_num);
         if payload.len() > MAX_PAYLOAD {
             warn!(
                 bytes = payload.len(),
@@ -698,11 +777,16 @@ impl MqttBridge {
         let Some(channel) = channel else {
             return false;
         };
+        let node_num = self.node_num();
+        if node_num == 0 {
+            debug!("standard mirror skipped: node number not known yet");
+            return false;
+        }
         let Some(topic) = standard_topic(
             &self.config.root_topic,
             &self.resolve_region(),
             &channel,
-            self.node_num,
+            node_num,
         ) else {
             return false;
         };
@@ -714,7 +798,7 @@ impl MqttBridge {
             return false;
         }
 
-        let payload = mqtt::build_envelope_with_channel(packet, self.node_num, &channel);
+        let payload = mqtt::build_envelope_with_channel(packet, node_num, &channel);
         if payload.len() > MAX_PAYLOAD {
             warn!(
                 bytes = payload.len(),
@@ -790,18 +874,19 @@ impl MqttBridge {
     }
 
     /// Handle one broker message (downlink) and inject it into the node.
-    fn handle_downlink(&self, topic: String, payload: Vec<u8>, retained: bool) {
-        if !is_valid_downlink_topic(&self.config.root_topic, &self.config.raw_root_topic, &topic) {
+    fn handle_downlink(&self, topic: &str, payload: &[u8], retained: bool) {
+        if !is_valid_downlink_topic(&self.config.root_topic, &self.config.raw_root_topic, topic) {
             debug!(%topic, "ignoring non-root downlink topic");
             return;
         }
+        self.remember_broker_message(topic, payload);
         if !self.config.downlink_enabled {
             self.dropped_downlink_disabled
                 .fetch_add(1, Ordering::Relaxed);
             debug!(%topic, "downlink disabled; dropped message");
             return;
         }
-        if self.is_recent_echo(&topic, &payload) {
+        if self.is_recent_echo(topic, payload) {
             self.echo_suppressed.fetch_add(1, Ordering::Relaxed);
             debug!(%topic, "echo suppression dropped our own uplink");
             return;
@@ -811,12 +896,13 @@ impl MqttBridge {
             info!(%topic, "skipping retained downlink (stale replay guard)");
             return;
         }
-        if is_own_envelope(&payload, self.node_num) {
+        let node_num = self.node_num();
+        if is_own_envelope(payload, node_num) {
             self.loop_guard_drops.fetch_add(1, Ordering::Relaxed);
             debug!("loop guard dropped our own envelope");
             return;
         }
-        if !self.state.connected.load(Ordering::SeqCst) || self.node_num == 0 {
+        if !self.state.connected.load(Ordering::SeqCst) || node_num == 0 {
             debug!("downlink deferred until the physical link is ready");
             return;
         }
@@ -825,10 +911,10 @@ impl MqttBridge {
         let to_radio = pb::ToRadio {
             payload_variant: Some(to_radio::PayloadVariant::MqttClientProxyMessage(
                 pb::MqttClientProxyMessage {
-                    topic,
+                    topic: topic.to_owned(),
                     retained: false,
                     payload_variant: Some(pb::mqtt_client_proxy_message::PayloadVariant::Data(
-                        payload,
+                        payload.to_vec(),
                     )),
                 },
             )),
@@ -858,6 +944,7 @@ impl MqttBridge {
             dropped_downlink: self.dropped_downlink_disabled.load(Ordering::Relaxed),
             loop_guard: self.loop_guard_drops.load(Ordering::Relaxed),
             echo: self.echo_suppressed.load(Ordering::Relaxed),
+            proxy_loop: self.proxy_loop_drops.load(Ordering::Relaxed),
             published2,
             dropped2,
         }
@@ -874,6 +961,7 @@ struct MqttStats {
     dropped_downlink: u64,
     loop_guard: u64,
     echo: u64,
+    proxy_loop: u64,
     published2: u64,
     dropped2: u64,
 }
@@ -894,6 +982,7 @@ async fn stats_loop(bridge: Arc<MqttBridge>, mut shutdown: watch::Receiver<bool>
                     dropped_downlink = stats.dropped_downlink,
                     loop_guard = stats.loop_guard,
                     echo = stats.echo,
+                    proxy_loop = stats.proxy_loop,
                     published2 = stats.published2,
                     dropped2 = stats.dropped2,
                     "MQTT bridge stats"
@@ -905,5 +994,135 @@ async fn stats_loop(bridge: Arc<MqttBridge>, mut shutdown: watch::Receiver<bool>
                 }
             }
         }
+    }
+}
+
+/// Keep a proxy topic under `{root}/`.
+///
+/// Unlike a bare prefix match, `mshfoo/x` is not treated as being under `msh`.
+fn proxy_topic_under_root(root: &str, topic: &str) -> String {
+    let root = root.trim_end_matches('/');
+    if topic == root
+        || topic
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.starts_with('/'))
+    {
+        topic.to_owned()
+    } else {
+        format!("{root}/{}", topic.trim_start_matches('/'))
+    }
+}
+
+/// Channel name of a proxy message: the envelope's `channel_id`, else the topic
+/// segment after `/2/e/`, `/2/c/` or `/2/json/`.
+fn proxy_channel_name(topic: &str, payload: &[u8]) -> Option<String> {
+    if let Some(envelope) = mqtt::decode_envelope(payload) {
+        if envelope.packet.is_some() && !envelope.channel_id.is_empty() {
+            return Some(envelope.channel_id);
+        }
+    }
+
+    let mut parts = topic.split('/');
+    while let Some(part) = parts.next() {
+        if part != "2" {
+            continue;
+        }
+        return match parts.next() {
+            Some("e" | "c" | "json") => parts
+                .next()
+                .filter(|name| !name.is_empty() && !name.starts_with('!'))
+                .map(str::to_owned),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// `uplink_enabled` of the active channel with this name, if the node has one.
+fn channel_uplink_by_name(channels: &[pb::Channel], name: &str) -> Option<bool> {
+    let mut found = None;
+    for channel in channels {
+        if channel.role == pb::channel::Role::Disabled as i32 {
+            continue;
+        }
+        let Some(settings) = channel.settings.as_ref() else {
+            continue;
+        };
+        if settings.name == name {
+            found = Some(found.unwrap_or(false) || settings.uplink_enabled);
+        }
+    }
+    found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn channel(index: i32, role: pb::channel::Role, name: &str, uplink: bool) -> pb::Channel {
+        pb::Channel {
+            index,
+            role: role as i32,
+            settings: Some(pb::ChannelSettings {
+                name: name.into(),
+                uplink_enabled: uplink,
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn proxy_topics_stay_under_the_root() {
+        assert_eq!(
+            proxy_topic_under_root("msh", "msh/EU_868/2/e/A/!1"),
+            "msh/EU_868/2/e/A/!1"
+        );
+        assert_eq!(proxy_topic_under_root("msh/", "msh"), "msh");
+        assert_eq!(proxy_topic_under_root("msh", "mshfoo/x"), "msh/mshfoo/x");
+        assert_eq!(proxy_topic_under_root("msh", "/other/x"), "msh/other/x");
+    }
+
+    #[test]
+    fn channel_name_comes_from_the_envelope_or_the_topic() {
+        let envelope = pb::ServiceEnvelope {
+            packet: Some(pb::MeshPacket {
+                id: 7,
+                ..Default::default()
+            }),
+            channel_id: "Madrid".into(),
+            gateway_id: "!00000001".into(),
+        }
+        .encode_to_vec();
+        assert_eq!(
+            proxy_channel_name("msh/EU_868/2/e/LongFast/!00000001", &envelope).as_deref(),
+            Some("Madrid")
+        );
+        assert_eq!(
+            proxy_channel_name("msh/EU_868/2/e/LongFast/!00000001", b"").as_deref(),
+            Some("LongFast")
+        );
+        assert_eq!(
+            proxy_channel_name("msh/EU_868/2/json/LongFast/!00000001", b"{}").as_deref(),
+            Some("LongFast")
+        );
+        assert_eq!(proxy_channel_name("msh/EU_868/2/map/", b""), None);
+        assert_eq!(proxy_channel_name("msh/EU_868/2/e/!00000001", b""), None);
+        assert_eq!(proxy_channel_name("msh/status", b""), None);
+    }
+
+    #[test]
+    fn uplink_gate_uses_the_named_channel_not_the_last_one() {
+        use pb::channel::Role;
+        // A real dump ends with disabled slots whose settings are zeroed.
+        let channels = vec![
+            channel(0, Role::Primary, "Madrid", true),
+            channel(1, Role::Secondary, "Private", false),
+            channel(7, Role::Disabled, "", false),
+        ];
+        assert_eq!(channel_uplink_by_name(&channels, "Madrid"), Some(true));
+        assert_eq!(channel_uplink_by_name(&channels, "Private"), Some(false));
+        // Unknown channels (e.g. the unnamed preset channel) are not blocked.
+        assert_eq!(channel_uplink_by_name(&channels, "LongFast"), None);
+        assert_eq!(channel_uplink_by_name(&channels, ""), None);
     }
 }

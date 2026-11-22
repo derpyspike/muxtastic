@@ -32,8 +32,16 @@ LoRa mesh ◄──► physical node
 Shared gates: packets with `via_mqtt=true` and non-LoRa transports
 (`transport_mechanism` outside `1..=4`) are skipped on the raw and mirror paths.
 Proxy relay is independent of the raw/mirror flags. Proxy publishes also require
-`uplink_enabled=true` and, unless `ignore_ok_to_mqtt=true`, the channel's
-`uplink_enabled` flag.
+`uplink_enabled=true` and, unless `ignore_ok_to_mqtt=true`, the `uplink_enabled`
+flag of the channel the message belongs to. The channel is taken from the
+envelope's `channel_id`, or from the topic (`msh/{region}/2/e/{channel}/...`);
+a channel the node does not list by that name is allowed.
+
+Proxy messages sent by a connected client are never published as retained, and
+a proxy topic outside `{root_topic}/` is placed under it.
+
+The bridge connects once the physical node has reported its node number, and
+never publishes with a placeholder id. Until then the bridge is idle.
 
 Region resolution: explicit `region` > region learned from a proxy topic >
 `EU_868`.

@@ -19,8 +19,9 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use muxtastic_core::channel_crypto::{self, ExtraChannel};
 use muxtastic_core::config::{Config, WebStorage};
+use muxtastic_core::meshcore::{MeshCoreChannel, MeshCoreKeys, MeshCoreRegion};
 use tokio::sync::{mpsc, watch};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 #[derive(Debug, Parser)]
 #[command(name = "muxtastic", version, about = "Meshtastic multiplexer")]
@@ -155,7 +156,7 @@ async fn main() -> anyhow::Result<()> {
             anyhow::bail!("--web-only requires [web] enabled = true");
         };
 
-        let web_task = spawn_web(
+        let mut web_task = spawn_web(
             config.web.clone(),
             Arc::clone(&database),
             WebNodes {
@@ -192,18 +193,27 @@ async fn main() -> anyhow::Result<()> {
             warn!("web-only mode has no MQTT source; enable [web.mqtt] to populate the UI");
         }
 
-        wait_for_shutdown().await;
+        // In web-only mode the web server is the whole service: losing it
+        // (for example a port that is already in use) is fatal.
+        let web_stopped = tokio::select! {
+            _ = wait_for_shutdown() => false,
+            _ = &mut web_task => true,
+        };
         info!("shutting down");
         let _ = shutdown.send(true);
         tokio::time::sleep(Duration::from_millis(300)).await;
         web_task.abort();
+        if web_stopped {
+            anyhow::bail!("the web server stopped unexpectedly");
+        }
         return Ok(());
     }
 
     let mut runtimes = Vec::new();
     for instance in config.instances() {
         let node_config = config.for_instance(&instance);
-        let (state, to_node_rx, resync_rx) = app::AppState::new(node_config, shutdown.clone());
+        let (state, to_node_rx, resync_rx) =
+            app::AppState::new(node_config, shutdown.clone(), args.mock);
         runtimes.push(NodeRuntime {
             name: instance.name,
             port: instance.server.port,
@@ -281,6 +291,13 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Listen first: neither the MQTT bridge nor mDNS may delay the mux port or
+    // the signal handler while they wait for the physical node.
+    let mut servers = tokio::task::JoinSet::new();
+    for (_, _, state) in &node_states {
+        servers.spawn(server::run(state.clone()));
+    }
+
     let mut dispatchers = Vec::new();
     let mut resync_tasks = Vec::new();
     let mut physical_tasks = Vec::new();
@@ -288,7 +305,6 @@ async fn main() -> anyhow::Result<()> {
 
     for (index, runtime) in runtimes.into_iter().enumerate() {
         let state = runtime.state;
-        let mock_node_num = muxtastic_core::SYNTHETIC_NODE_NUM.wrapping_add(index as u32);
 
         dispatchers.push(tokio::spawn(app::dispatcher(
             state.clone(),
@@ -299,42 +315,16 @@ async fn main() -> anyhow::Result<()> {
             runtime.resync_rx,
         )));
         physical_tasks.push(if args.mock {
+            // Only the mock may use the synthetic node id.
+            let mock_node_num = muxtastic_core::SYNTHETIC_NODE_NUM.wrapping_add(index as u32);
             tokio::spawn(mock::run(state.clone(), mock_node_num))
         } else {
             tokio::spawn(physical::run(state.clone()))
         });
 
         if state.config.mqtt_bridge.enabled {
-            let wait = if args.mock {
-                Duration::from_secs(5)
-            } else {
-                Duration::from_secs(15)
-            };
-            let provision = !args.mock;
-            bridge_tasks.push(tokio::spawn(async move {
-                let node_num = wait_for_node_num(&state, wait, mock_node_num).await;
-                let bridge = Arc::new(mqtt::MqttBridge::new(state.clone(), node_num));
-                state.set_mqtt_bridge(&bridge);
-                bridge.start();
-                if provision {
-                    tokio::spawn(provision::run(state.clone(), bridge.clone()));
-                }
-                bridge
-            }));
+            bridge_tasks.push(tokio::spawn(run_bridge(state, !args.mock)));
         }
-    }
-
-    let mut bridges = Vec::new();
-    for task in bridge_tasks {
-        match task.await {
-            Ok(bridge) => bridges.push(bridge),
-            Err(error) => warn!(%error, "MQTT bridge setup task failed"),
-        }
-    }
-
-    let mut servers = tokio::task::JoinSet::new();
-    for (_, _, state) in &node_states {
-        servers.spawn(server::run(state.clone()));
     }
 
     let mdns_timeout = if args.mock {
@@ -349,36 +339,38 @@ async fn main() -> anyhow::Result<()> {
             mdns::start(&state, mdns_timeout).await
         }));
     }
-    let mut mdns_handles = Vec::new();
-    for task in mdns_tasks {
-        match task.await {
-            Ok(Some(handle)) => mdns_handles.push(handle),
-            Ok(None) => {}
-            Err(error) => warn!(%error, "mDNS task failed"),
-        }
-    }
 
+    let mut failure: Option<anyhow::Error> = None;
     tokio::select! {
         _ = wait_for_shutdown() => {}
         result = servers.join_next() => {
-            match result {
-                Some(Ok(())) => warn!("a TCP server stopped unexpectedly"),
-                Some(Err(error)) => warn!(%error, "a TCP server task failed"),
-                None => warn!("all TCP servers stopped"),
-            }
+            // A server only returns when shutdown was requested, so reaching
+            // this arm means it could not run (typically a bind failure).
+            let reason = match result {
+                Some(Ok(Ok(()))) => anyhow::anyhow!("a TCP server stopped unexpectedly"),
+                Some(Ok(Err(error))) => error,
+                Some(Err(error)) => anyhow::anyhow!("a TCP server task failed: {error}"),
+                None => anyhow::anyhow!("no TCP server is running"),
+            };
+            error!(error = %format!("{reason:#}"), "fatal: the multiplexer cannot serve clients");
+            failure = Some(reason);
         }
     }
     info!("shutting down");
 
     let _ = shutdown.send(true);
-    for handle in mdns_handles {
-        handle.shutdown();
-    }
-    for bridge in bridges {
-        bridge.stop();
+    for task in mdns_tasks {
+        if task.is_finished() {
+            if let Ok(Some(handle)) = task.await {
+                handle.shutdown();
+            }
+        } else {
+            task.abort();
+        }
     }
 
-    // Give client writers a moment to flush before the runtime drops.
+    // Give client writers and the MQTT legs a moment to stop before the
+    // runtime drops.
     tokio::time::sleep(Duration::from_millis(300)).await;
     servers.abort_all();
     for task in dispatchers {
@@ -390,11 +382,63 @@ async fn main() -> anyhow::Result<()> {
     for task in physical_tasks {
         task.abort();
     }
+    for task in bridge_tasks {
+        task.abort();
+    }
     if let Some(web_task) = web_task.take() {
         web_task.abort();
     }
 
-    Ok(())
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// Own one node's MQTT bridge for the life of the process.
+///
+/// The bridge is created only once the physical node has reported its number,
+/// however long that takes, so it never adopts a placeholder identity.
+/// Provisioning runs right after, which is the first moment it can work.
+async fn run_bridge(state: Arc<app::AppState>, provision: bool) {
+    let mut shutdown = state.subscribe_shutdown();
+    let waiting_since = Instant::now();
+    let mut announced = false;
+
+    while state.node_num() == 0 {
+        if *shutdown.borrow() {
+            return;
+        }
+        if !announced && waiting_since.elapsed() >= Duration::from_secs(15) {
+            announced = true;
+            info!("MQTT bridge is waiting for the physical node to report its number");
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+        }
+    }
+
+    let bridge = Arc::new(mqtt::MqttBridge::new(state.clone()));
+    state.set_mqtt_bridge(&bridge);
+    bridge.start();
+    let provision_task =
+        provision.then(|| tokio::spawn(provision::run(state.clone(), bridge.clone())));
+
+    while !*shutdown.borrow() {
+        if shutdown.changed().await.is_err() {
+            break;
+        }
+    }
+
+    if let Some(task) = provision_task {
+        task.abort();
+    }
+    bridge.stop();
 }
 
 fn spawn_cleanup(
@@ -459,7 +503,34 @@ fn open_web_database(config: &Config) -> Option<Arc<muxtastic_web::Database>> {
         WebStorage::Sqlite => config.web.database.as_str(),
         WebStorage::Memory => ":memory:",
     };
-    match muxtastic_web::Database::open_with_channels(database_path, extra_channels) {
+    let meshcore_channels = config
+        .web
+        .meshcore_channels
+        .iter()
+        .filter_map(
+            |channel| match MeshCoreChannel::from_config(&channel.name, &channel.key) {
+                Ok(channel) => Some(channel),
+                Err(error) => {
+                    warn!(%error, "ignoring invalid MeshCore channel");
+                    None
+                }
+            },
+        )
+        .collect();
+    let meshcore_regions = config
+        .web
+        .meshcore_regions
+        .iter()
+        .filter(|name| !name.trim().is_empty())
+        .map(|name| MeshCoreRegion::named(name))
+        .collect();
+    let meshcore = MeshCoreKeys::new(meshcore_channels, meshcore_regions);
+    info!(
+        channels = meshcore.channels().len(),
+        regions = meshcore.regions().len(),
+        "MeshCore keys loaded"
+    );
+    match muxtastic_web::Database::open_with_keys(database_path, extra_channels, meshcore) {
         Ok((database, receiver)) => {
             tokio::spawn(muxtastic_web::run_writer(
                 Arc::downgrade(&database),
@@ -636,20 +707,6 @@ fn spawn_web(
             warn!(%error, "web UI stopped");
         }
     })
-}
-
-async fn wait_for_node_num(state: &Arc<app::AppState>, wait: Duration, fallback: u32) -> u32 {
-    let deadline = Instant::now() + wait;
-    loop {
-        let node_num = state.node_num();
-        if node_num != 0 {
-            return node_num;
-        }
-        if Instant::now() >= deadline {
-            return fallback;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
 }
 
 async fn wait_for_shutdown() {

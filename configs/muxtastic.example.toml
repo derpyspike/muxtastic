@@ -46,6 +46,10 @@ database = "data/muxtastic.db"  # SQLite file; connect with any sqlite client
 storage = "sqlite"              # "sqlite" or "memory" (volatile, no file)
 retention_days = 7              # prune packets/messages/raw/traces older than this; 0 = keep forever
 try_all_one_byte_keys = false   # append all 255 non-zero 1-byte PSKs to extra_channels
+# Map tiles are fetched by the browser from this server; "" = markers only.
+map_tile_url = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+map_attribution = "© OpenStreetMap contributors"
+meshcore_regions = []           # region names tried on region-scoped MeshCore packets, e.g. ["madrid"]
 
 [web.mqtt]
 # Read-only broker source; also runs alongside physical nodes.
@@ -67,6 +71,14 @@ keepalive = 60
 # [[web.extra_channels]]
 # name = "*"
 # key = "AQ=="
+
+# MeshCore group channels to decrypt. Public is always included; "#hashtag"
+# channels need no key; private channels need a 16/32-byte key (base64 or hex).
+# [[web.meshcore_channels]]
+# name = "#madrid"
+# [[web.meshcore_channels]]
+# name = "Family"
+# key = "…"
 
 [mqtt_bridge]
 # Proxy relay + optional raw gateway and standard mirror. See docs/mqtt.md.

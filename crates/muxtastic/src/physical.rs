@@ -2,13 +2,13 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use meshtastic::protobufs::{self as pb, from_radio, to_radio};
 use meshtastic::Message;
 use muxtastic_core::config::ConnectionType;
 use muxtastic_core::protocol::{encode_frame, FrameDecoder};
 use muxtastic_core::router::{route_from_physical, PhysicalRoute};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
@@ -126,6 +126,12 @@ async fn read_loop(state: Arc<AppState>, mut reader: BoxReader) {
     let mut shutdown = state.subscribe_shutdown();
 
     loop {
+        // A failed or timed-out write drops the writer and clears this flag.
+        if !state.connected.load(Ordering::SeqCst) {
+            warn!("physical writer was dropped; reconnecting");
+            break;
+        }
+
         let read = tokio::time::timeout(Duration::from_secs(1), reader.read(&mut buffer));
 
         tokio::select! {
@@ -208,10 +214,8 @@ pub(crate) async fn handle_from_radio(state: &Arc<AppState>, payload: Vec<u8>) {
         );
     }
 
-    if let Some(bridge) = state.mqtt_bridge() {
-        if let Some(from_radio::PayloadVariant::Channel(channel)) = &frame.payload_variant {
-            bridge.mark_channel(channel.index);
-        }
+    if let Some(from_radio::PayloadVariant::ConfigCompleteId(_)) = &frame.payload_variant {
+        state.synced.store(true, Ordering::SeqCst);
     }
 
     match route_from_physical(&frame) {
@@ -249,10 +253,11 @@ pub(crate) async fn handle_from_radio(state: &Arc<AppState>, payload: Vec<u8>) {
             retained,
         } => {
             if let Some(bridge) = state.mqtt_bridge() {
+                // Record the proxy-covered id before any publish task runs, so
+                // the raw gateway and standard mirror cannot race past it.
+                bridge.note_proxy_envelope(&proxy_payload);
                 tokio::spawn(async move {
-                    bridge
-                        .publish_from_physical_proxy(topic, proxy_payload, retained)
-                        .await;
+                    bridge.publish_proxy(topic, proxy_payload, retained).await;
                 });
             }
         }
@@ -284,12 +289,7 @@ async fn send_to_writer(state: &Arc<AppState>, payload: &[u8]) -> bool {
 }
 
 async fn write_raw(state: &Arc<AppState>, bytes: &[u8]) -> Result<()> {
-    let mut slot = state.writer.lock().await;
-    let Some(writer) = slot.as_mut() else {
-        bail!("physical node is not connected");
-    };
-    writer.write_all(bytes).await?;
-    writer.flush().await?;
+    state.write_physical(bytes).await?;
     Ok(())
 }
 

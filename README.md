@@ -41,6 +41,9 @@ App N ─┘                  Rust/Tokio
   Receptions, Traces, Sources
 - Packet and node family switches for Meshtastic, MeshCore and Reticulum
 - MeshCore/Reticulum advert tracking and repeated-reception counts in Chat
+- MeshCore group-text decryption (Public, hashtag and private channels), paths
+  with repeater names, and region names for region-scoped packets
+- Map of Meshtastic and MeshCore nodes
 - Per-gateway receptions, channel scoping, gateway-name resolution
 - Per-source RSSI/SNR/Δf graphs and relay-node signal statistics
 - Sources dropdowns for direct nodes, MQTT gateways and connected clients
@@ -70,8 +73,13 @@ Docker:
 
 ```bash
 cp configs/config.example.yaml configs/config.yaml
+mkdir -p logs data          # as your own user, so the container can write them
 docker compose up -d
 ```
+
+The container runs as an unprivileged user (UID/GID 1000, member of `dialout`).
+See the notes in [`docker-compose.yml`](docker-compose.yml) for other host
+user ids and for USB serial devices.
 
 | Option | Description |
 |---|---|
@@ -154,7 +162,8 @@ once-per-boot provisioning. Full reference: [docs/mqtt.md](docs/mqtt.md).
 
 | Direction | Rule |
 |---|---|
-| Client → node | `ADMIN_APP` needs loopback, `allow_admin_from`, or `from == to` |
+| Client → node | `ADMIN_APP` needs loopback or `allow_admin_from` |
+| Pre-encrypted client packet | Blocked (cannot be inspected); JRAW tunnel chunks pass |
 | `removeByNodenum` | Fake success ACK; command dropped |
 | `addContact` | Always blocked |
 | `from == 0` + PKI | Encryption stripped before forwarding |
@@ -180,7 +189,9 @@ cargo fmt --all --check
 
 ## Releases
 
-Manual **Actions → Release → Run workflow**, tag input. Builds Linux x86_64,
+Push a tag that matches the Cargo version (`v0.2.0` for `0.2.0`), then run
+**Actions → Release → Run workflow** with that tag. The workflow checks out the
+tag, refuses a tag/version mismatch, runs the tests, and builds Linux x86_64,
 ARM64 and ARMv7 archives with checksums via [`.github/workflows/release.yml`](.github/workflows/release.yml).
 
 ## License
